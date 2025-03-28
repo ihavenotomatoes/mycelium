@@ -1,0 +1,13 @@
+[Unit]
+Description=mycelium default config generator
+ConditionPathExists=|!/etc/mycelium/config.toml
+ConditionFileNotEmpty=|!/etc/mycelium/config.toml
+Wants=local-fs.target
+After=local-fs.target
+
+[Service]
+Type=oneshot
+Group=root
+ExecStartPre=/usr/bin/mkdir -p /etc/mycelium
+ExecStart=/usr/bin/cp /usr/share/mycelium/config_example.toml /etc/mycelium/config.toml
+ExecStartPost=/usr/bin/chmod 0640 /etc/mycelium/config.toml
