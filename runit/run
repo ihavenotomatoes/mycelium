@@ -1,0 +1,12 @@
+#!/bin/sh
+modprobe tun
+mkdir -p /etc/mycelium
+cd /etc/mycelium
+caps='-all,+NET_ADMIN,+NET_RAW'
+drop_caps="setpriv --inh-caps $caps --bounding-set $caps"
+if [ -f /etc/mycelium/config.toml ]; then
+        exec $drop_caps mycelium -k /etc/mycelium/priv_key.bin -c /etc/mycelium/config.toml 2>&1
+else
+        exec $drop_caps cp /usr/share/mycelium/config_example.toml /etc/mycelium/config.toml
+        exec $drop_caps mycelium -k /etc/mycelium/priv_key.bin -c /etc/mycelium/config.toml 2>&1
+fi
