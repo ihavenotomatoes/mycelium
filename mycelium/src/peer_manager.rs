@@ -1,4 +1,6 @@
-use crate::connection::Quic;
+#[cfg(feature = "private-network")]
+use crate::connection::tls::TlsStream;
+use crate::connection::{Quic, TcpStream};
 use crate::endpoint::{Endpoint, Protocol};
 use crate::metrics::Metrics;
 use crate::peer::{Peer, PeerRef};
@@ -9,7 +11,7 @@ use futures::{FutureExt, StreamExt};
 #[cfg(feature = "private-network")]
 use openssl::ssl::{Ssl, SslAcceptor, SslConnector, SslMethod};
 use quinn::crypto::rustls::QuicClientConfig;
-use quinn::{MtuDiscoveryConfig, ServerConfig, TransportConfig};
+use quinn::{congestion, MtuDiscoveryConfig, ServerConfig, TransportConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -24,10 +26,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{collections::hash_map::Entry, future::IntoFuture};
-use tokio::net::TcpStream;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::task::AbortHandle;
-use tokio::time::MissedTickBehavior;
+use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, error, info, instrument, trace, warn};
 
 /// Magic bytes to identify a multicast UDP packet used in link local peer discovery.
@@ -75,6 +76,19 @@ pub enum PeerType {
     Inbound,
 }
 
+/// Defines how peer discovery operates regarding network interfaces.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PeerDiscoveryMode {
+    /// Discover peers on all qualifying interfaces (default behavior).
+    #[default]
+    All,
+    /// Peer discovery is completely disabled.
+    Disabled,
+    /// Only discover peers on interfaces whose names match the provided list.
+    Filtered(Vec<String>),
+}
+
 /// Local info about a peer.
 struct PeerInfo {
     /// Details how we found out about this peer.
@@ -88,6 +102,10 @@ struct PeerInfo {
     connection_attempts: usize,
     /// Keep track of the amount of bytes we've sent to and received from this peer.
     con_traffic: ConnectionTraffic,
+    /// The moment in time we learned about this peer.
+    discovered: Instant,
+    /// The moment we last connected to this peer.
+    connected: Option<Instant>,
 }
 
 /// Counters for the amount of traffic written to and received from a [`Peer`].
@@ -126,6 +144,10 @@ pub struct PeerStats {
     pub tx_bytes: u64,
     /// Amount of bytes received from this [`Peer`].
     pub rx_bytes: u64,
+    /// Amount of time which passed since the system learned about this [`Peer`], in seconds.
+    pub discovered: u64,
+    /// Amount of seconds since the last succesfull connection to this [`Peer`].
+    pub last_connected: Option<u64>,
 }
 
 impl PeerInfo {
@@ -138,7 +160,7 @@ impl PeerInfo {
     /// Return the amount of bytes written to this peer.
     #[inline]
     fn written(&self) -> u64 {
-        self.con_traffic.rx_bytes.load(Ordering::Relaxed)
+        self.con_traffic.tx_bytes.load(Ordering::Relaxed)
     }
 }
 
@@ -177,7 +199,7 @@ where
         tcp_listen_port: u16,
         quic_listen_port: Option<u16>,
         peer_discovery_port: u16,
-        disable_peer_discovery: bool,
+        peer_discovery_mode: PeerDiscoveryMode,
         private_network_config: Option<(String, PrivateNetworkKey)>,
         metrics: M,
         firewall_mark: Option<u32>,
@@ -212,6 +234,7 @@ where
                         // loop will perform the actual check and figure out they are dead, then
                         // (re)connect.
                         .map(|s| {
+                            let now = tokio::time::Instant::now();
                             (
                                 s,
                                 PeerInfo {
@@ -223,6 +246,8 @@ where
                                         tx_bytes: Arc::new(AtomicU64::new(0)),
                                         rx_bytes: Arc::new(AtomicU64::new(0)),
                                     },
+                                    discovered: now,
+                                    connected: None,
                                 },
                             )
                         })
@@ -254,16 +279,30 @@ where
         let handle = tokio::spawn(peer_manager.inner.clone().connect_to_peers());
         peer_manager.abort_handles.push(handle.abort_handle());
 
-        // Discover local peers, this does not actually connect to them. That is handle by the
+        // Discover local peers, this does not actually connect to them. That is handled by the
         // connect_to_peers task.
-        if !disable_peer_discovery {
-            let handle = tokio::spawn(
-                peer_manager
-                    .inner
-                    .clone()
-                    .local_discovery(peer_discovery_port),
-            );
-            peer_manager.abort_handles.push(handle.abort_handle());
+        match peer_discovery_mode {
+            PeerDiscoveryMode::Disabled => {
+                // No discovery task spawned
+            }
+            PeerDiscoveryMode::All => {
+                let handle = tokio::spawn(
+                    peer_manager
+                        .inner
+                        .clone()
+                        .local_discovery(peer_discovery_port, None),
+                );
+                peer_manager.abort_handles.push(handle.abort_handle());
+            }
+            PeerDiscoveryMode::Filtered(interfaces) => {
+                let handle = tokio::spawn(
+                    peer_manager
+                        .inner
+                        .clone()
+                        .local_discovery(peer_discovery_port, Some(interfaces)),
+                );
+                peer_manager.abort_handles.push(handle.abort_handle());
+            }
         }
 
         Ok(peer_manager)
@@ -281,6 +320,7 @@ where
         if peer_map.contains_key(&peer) {
             return Err(PeerExists);
         }
+        let now = tokio::time::Instant::now();
         peer_map.insert(
             peer,
             PeerInfo {
@@ -292,6 +332,8 @@ where
                     tx_bytes: Arc::new(AtomicU64::new(0)),
                     rx_bytes: Arc::new(AtomicU64::new(0)),
                 },
+                discovered: now,
+                connected: None,
             },
         );
 
@@ -333,6 +375,8 @@ where
                 connection_state,
                 tx_bytes: peer_info.written(),
                 rx_bytes: peer_info.read(),
+                discovered: peer_info.discovered.elapsed().as_secs(),
+                last_connected: peer_info.connected.map(|i| i.elapsed().as_secs()),
             });
         }
         pi
@@ -382,6 +426,7 @@ where
 
                             // We successfully connected, reset the connection_attempts counter to 0
                             pi.connection_attempts = 0;
+                            pi.connected = Some(tokio::time::Instant::now());
                         } else {
                             // Only log with error level on the first connection failure, to avoid spamming the logs
                             if pi.connection_attempts == 0 {
@@ -479,7 +524,7 @@ where
             None
         };
 
-        match TcpStream::connect(endpoint.address())
+        match tokio::net::TcpStream::connect(endpoint.address())
             .map(|result| result.and_then(|socket| set_fw_mark(socket, self.firewall_mark)))
             .await
         {
@@ -528,35 +573,57 @@ where
                         }
                         debug!("Completed TLS handshake");
 
+                        let tls_stream = match TlsStream::new(ssl_stream, ct.rx_bytes, ct.tx_bytes)
+                        {
+                            Ok(tls_stream) => tls_stream,
+                            Err(err) => {
+                                error!(%err, "Failed to create wrapped Tls stream");
+                                return (endpoint, None);
+                            }
+                        };
+
                         Peer::new(
                             router_data_tx,
                             router_control_tx,
-                            ssl_stream,
+                            tls_stream,
                             dead_peer_sink,
-                            ct.tx_bytes,
-                            ct.rx_bytes,
                         )
                     } else {
+                        let peer_stream =
+                            match TcpStream::new(peer_stream, ct.rx_bytes, ct.tx_bytes) {
+                                Ok(ps) => ps,
+                                Err(err) => {
+                                    error!(%err, "Failed to create wrapped tcp stream");
+                                    return (endpoint, None);
+                                }
+                            };
+
                         Peer::new(
                             router_data_tx,
                             router_control_tx,
                             peer_stream,
                             dead_peer_sink,
-                            ct.tx_bytes,
-                            ct.rx_bytes,
                         )
                     }
                 };
 
                 #[cfg(not(feature = "private-network"))]
-                let res = Peer::new(
-                    router_data_tx,
-                    router_control_tx,
-                    peer_stream,
-                    dead_peer_sink,
-                    ct.tx_bytes,
-                    ct.rx_bytes,
-                );
+                let res = {
+                    let peer_stream = match TcpStream::new(peer_stream, ct.rx_bytes, ct.tx_bytes) {
+                        Ok(ps) => ps,
+                        Err(err) => {
+                            error!(%err, "Failed to create wrapped tcp stream");
+                            return (endpoint, None);
+                        }
+                    };
+
+                    Peer::new(
+                        router_data_tx,
+                        router_control_tx,
+                        peer_stream,
+                        dead_peer_sink,
+                    )
+                };
 
                 match res {
                     Ok(new_peer) => {
@@ -613,29 +680,23 @@ where
         transport_config.mtu_discovery_config(Some(MtuDiscoveryConfig::default()));
         transport_config.keep_alive_interval(Some(Duration::from_secs(20)));
         // we don't use datagrams.
-        transport_config.datagram_receive_buffer_size(None);
-        transport_config.datagram_send_buffer_size(0);
+        transport_config.datagram_receive_buffer_size(Some(16 << 20));
+        transport_config.datagram_send_buffer_size(16 << 20);
+        transport_config.initial_mtu(1500);
         config.transport_config(Arc::new(transport_config));
 
         match quic_socket.connect_with(config, endpoint.address(), "dummy.mycelium") {
             Ok(connecting) => match connecting.await {
                 Ok(con) => match con.open_bi().await {
                     Ok((tx, rx)) => {
-                        let q_con = Quic::new(tx, rx, endpoint.address());
+                        let q_con = Quic::new(tx, rx, con, ct.tx_bytes, ct.rx_bytes);
                         let res = {
                             let router = self.router.lock().unwrap();
                             let router_data_tx = router.router_data_tx();
                             let router_control_tx = router.router_control_tx();
                             let dead_peer_sink = router.dead_peer_sink().clone();
 
-                            Peer::new(
-                                router_data_tx,
-                                router_control_tx,
-                                q_con,
-                                dead_peer_sink,
-                                ct.tx_bytes,
-                                ct.rx_bytes,
-                            )
+                            Peer::new(router_data_tx, router_control_tx, q_con, dead_peer_sink)
                         };
                         match res {
                             Ok(new_peer) => {
@@ -743,42 +804,71 @@ where
                             }
                             debug!(%remote, "Accepted TLS handshake");
 
+                            let tls_stream = match TlsStream::new(
+                                ssl_stream,
+                                rx_bytes.clone(),
+                                tx_bytes.clone(),
+                            ) {
+                                Ok(tls_stream) => tls_stream,
+                                Err(err) => {
+                                    error!(%err, "Failed to create wrapped Tls stream");
+                                    continue;
+                                }
+                            };
+
                             Peer::new(
                                 router_data_tx.clone(),
                                 router_control_tx.clone(),
-                                ssl_stream,
+                                tls_stream,
                                 dead_peer_sink.clone(),
-                                tx_bytes.clone(),
-                                rx_bytes.clone(),
                             )
                         } else {
+                            let new_stream =
+                                match TcpStream::new(stream, rx_bytes.clone(), tx_bytes.clone()) {
+                                    Ok(ns) => ns,
+                                    Err(err) => {
+                                        error!(%err, "Failed to create wrapped tcp stream");
+                                        continue;
+                                    }
+                                };
+
                             Peer::new(
                                 router_data_tx.clone(),
                                 router_control_tx.clone(),
-                                stream,
+                                new_stream,
                                 dead_peer_sink.clone(),
-                                tx_bytes.clone(),
-                                rx_bytes.clone(),
                             )
                         };
 
                         #[cfg(not(feature = "private-network"))]
-                        let new_peer = Peer::new(
-                            router_data_tx.clone(),
-                            router_control_tx.clone(),
-                            stream,
-                            dead_peer_sink.clone(),
-                            tx_bytes.clone(),
-                            rx_bytes.clone(),
-                        );
+                        let new_peer = {
+                            let new_stream =
+                                match TcpStream::new(stream, rx_bytes.clone(), tx_bytes.clone()) {
+                                    Ok(ns) => ns,
+                                    Err(err) => {
+                                        error!(%err, "Failed to create wrapped tcp stream");
+                                        continue;
+                                    }
+                                };
 
-                        let new_peer = match new_peer {
-                            Ok(peer) => peer,
-                            Err(e) => {
-                                error!(err=%e, "Failed to spawn peer");
-                                continue;
+                            Peer::new(
+                                router_data_tx.clone(),
+                                router_control_tx.clone(),
+                                new_stream,
+                                dead_peer_sink.clone(),
+                            )
+                        };
+
+                        let new_peer = {
+                            match new_peer {
+                                Ok(peer) => peer,
+                                Err(e) => {
+                                    error!(err=%e, "Failed to spawn peer");
+                                    continue;
+                                }
                             }
                         };
+
                         info!("Accepted new inbound peer");
                         self.add_peer(
                             Endpoint::new(
@@ -846,24 +936,25 @@ where
                                 return;
                             }
                         };
+                        let remote_address = con.remote_address();
+
+
+                        let tx_bytes = Arc::new(AtomicU64::new(0));
+                        let rx_bytes = Arc::new(AtomicU64::new(0));
 
                         let quic_peer = match con.accept_bi().await {
-                            Ok((tx, rx)) => Quic::new(tx, rx, con.remote_address()),
+                            Ok((tx, rx)) => Quic::new(tx, rx, con, rx_bytes.clone(), tx_bytes.clone()),
                             Err(e) => {
                                 debug!(err=%e, "Failed to accept bidirectional quic stream");
                                 return;
                             }
                         };
 
-                        let tx_bytes = Arc::new(AtomicU64::new(0));
-                        let rx_bytes = Arc::new(AtomicU64::new(0));
                         let new_peer = match Peer::new(
                             router_data_tx.clone(),
                             router_control_tx.clone(),
                             quic_peer,
                             dead_peer_sink.clone(),
-                            tx_bytes.clone(),
-                            rx_bytes.clone(),
                         ) {
                             Ok(peer) => peer,
                             Err(e) => {
@@ -871,9 +962,9 @@ where
                                 return;
                             }
                         };
-                        info!(remote=%con.remote_address(), "Accepted new inbound quic peer");
+                        info!(remote=%remote_address, "Accepted new inbound quic peer");
                         self.add_peer(
-                            Endpoint::new(Protocol::Quic, con.remote_address()),
+                            Endpoint::new(Protocol::Quic, remote_address),
                             PeerType::Inbound,
                             ConnectionTraffic { tx_bytes, rx_bytes },
                             Some(new_peer),
@@ -916,6 +1007,7 @@ where
             }
         }
         // Only if we don't know it yet.
+        let now = tokio::time::Instant::now();
         if let Entry::Vacant(e) = peers.entry(endpoint) {
             e.insert(PeerInfo {
                 pt: discovery_type,
@@ -927,6 +1019,8 @@ where
                 },
                 connection_attempts: 0,
                 con_traffic,
+                discovered: now,
+                connected: if peer.is_some() { Some(now) } else { None },
             });
             if let Some(p) = peer {
                 self.router.lock().unwrap().add_peer_interface(p);
@@ -936,6 +1030,10 @@ where
             // We got an inbound peer with a duplicate entry. This is possible if the sending port
             // is the same as the previous one, which generally happens with our Quic setup. In
             // this case, the old connection needs to be replaced.
+            let discovered = peers
+                .get(&endpoint)
+                .map(|epi| epi.discovered)
+                .unwrap_or(now);
             let old_peer_info = peers.insert(
                 endpoint,
                 PeerInfo {
@@ -948,6 +1046,8 @@ where
                     },
                     connection_attempts: 0,
                     con_traffic,
+                    discovered,
+                    connected: Some(now),
                 },
             );
             // If we have a new peer notify insert the new one in the router, then notify it that
@@ -973,7 +1073,12 @@ where
     }
 
     /// Use multicast discovery to find local peers.
-    async fn local_discovery(self: Arc<Self>, peer_discovery_port: u16) {
+    /// When `allowed_interfaces` is provided, only join multicast groups on those interfaces.
+    async fn local_discovery(
+        self: Arc<Self>,
+        peer_discovery_port: u16,
+        allowed_interfaces: Option<Vec<String>>,
+    ) {
         let rid = self.router.lock().unwrap().router_id();
 
         let multicast_destination = LL_PEER_DISCOVERY_GROUP
@@ -1004,7 +1109,7 @@ where
         let mut joined_interfaces = HashSet::new();
         // Join the multicast discovery group on newly detected interfaces.
         let join_new_interfaces = |joined_interfaces: &mut HashSet<_>| {
-            let ipv6_nics = list_ipv6_interface_ids()?;
+            let ipv6_nics = list_ipv6_interface_ids(allowed_interfaces.as_deref())?;
             // Keep the existing interfaces, removing interface ids we previously joined but are no
             // longer found when listing ids. We simply discard unknown ids, and assume if the
             // interface is gone (or it's IPv6), that we also implicitly left the group (i.e. no
@@ -1158,14 +1263,17 @@ fn make_quic_endpoint(
     quic_listen_port: u16,
     firewall_mark: Option<u32>,
 ) -> Result<quinn::Endpoint, Box<dyn std::error::Error>> {
-    // Install ring crypto provider for rustls
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())
-        .expect("Crypto provider has not been installed yet");
+    // Install ring crypto provider for rustls (only if not already installed)
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())
+            .expect("Failed to install crypto provider");
+    }
+
     // Generate self signed certificate certificate.
     // TODO: sign with router keys
     let cert = rcgen::generate_simple_self_signed(vec![format!("{router_id}")])?;
     let certificate_der = CertificateDer::from(cert.cert);
-    let private_key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+    let private_key = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
     let certificate_chain = vec![certificate_der];
 
     let mut server_config = ServerConfig::with_single_cert(certificate_chain, private_key.into())?;
@@ -1180,16 +1288,21 @@ fn make_quic_endpoint(
     transport_config.max_idle_timeout(Some(Duration::from_secs(60).try_into()?));
     transport_config.mtu_discovery_config(Some(MtuDiscoveryConfig::default()));
     transport_config.keep_alive_interval(Some(Duration::from_secs(20)));
-    // we don't use datagrams.
-    transport_config.datagram_receive_buffer_size(None);
-    transport_config.datagram_send_buffer_size(0);
-    // TODO: further tweak this.
+    transport_config.datagram_receive_buffer_size(Some(16 << 20));
+    transport_config.datagram_send_buffer_size(16 << 20);
+    transport_config.initial_mtu(1500);
+    transport_config.enable_segmentation_offload(true);
+    transport_config.send_window((8 * (10u32 << 20)).into());
+    transport_config.stream_receive_window((10u32 << 20).into());
+    let mut congestion_controller = congestion::CubicConfig::default();
+    congestion_controller.initial_window(1 << 22); // 4MiB
+                                                   // TODO: further tweak this.
 
     let socket = std::net::UdpSocket::bind(("::", quic_listen_port))
         .and_then(|socket| set_fw_mark(socket, firewall_mark))?;
     debug!("Bound UDP socket for Quic");
 
-    //TODO tweak or confirm
+    // TODO: tweak or confirm
     let endpoint = quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
         Some(server_config),
@@ -1207,10 +1320,8 @@ fn set_fw_mark<S: AsFd>(socket: S, mark: Option<u32>) -> io::Result<S> {
     use nix::sys::socket::{setsockopt, sockopt};
 
     if let Some(mark) = mark {
-        setsockopt(&socket, sockopt::Mark, &mark).map_or_else(
-            |errno| Err(io::Error::new(io::ErrorKind::Other, errno)),
-            |_| Ok(socket),
-        )
+        setsockopt(&socket, sockopt::Mark, &mark)
+            .map_or_else(|errno| Err(io::Error::other(errno)), |_| Ok(socket))
     } else {
         Ok(socket)
     }
@@ -1277,7 +1388,10 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
 }
 
 /// Get a list of the interface identifiers of every network interface with a local IPv6 IP.
-fn list_ipv6_interface_ids() -> Result<HashSet<u32>, Box<dyn std::error::Error>> {
+/// When `allowed_interfaces` is provided, only interfaces with matching names are returned.
+fn list_ipv6_interface_ids(
+    allowed_interfaces: Option<&[String]>,
+) -> Result<HashSet<u32>, Box<dyn std::error::Error>> {
     let mut nics = HashSet::new();
     for nic in netdev::get_interfaces()
         .into_iter()
@@ -1288,6 +1402,12 @@ fn list_ipv6_interface_ids() -> Result<HashSet<u32>, Box<dyn std::error::Error>>
                 && !nic.is_point_to_point()
                 && nic.is_multicast()
                 && nic.is_up()
+        })
+        // Apply name filter if provided
+        .filter(|nic| {
+            allowed_interfaces
+                .map(|names| names.iter().any(|name| name == &nic.name))
+                .unwrap_or(true)
         })
     {
         for addr in nic.ipv6 {

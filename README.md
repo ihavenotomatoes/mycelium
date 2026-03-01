@@ -1,6 +1,7 @@
 # Mycelium
 
-Mycelium is an IPv6 overlay network written in Rust. Each node that joins the overlay network will receive an overlay network IP in the 400::/7 range.
+Mycelium is an IPv6 overlay network written in Rust. Each node that joins the overlay
+network will receive an overlay network IP in the 400::/7 range.
 
 ## Features
 
@@ -26,6 +27,8 @@ Mycelium is an IPv6 overlay network written in Rust. Each node that joins the ov
 
 Get an useable binary, either by downloading [an artifact from a release](https://github.com/threefoldtech/mycelium/releases),
 or by [checking out and building the code yourself](#developing).
+
+For ArchLinux distribution there's [mycelium AUR package](https://aur.archlinux.org/packages/mycelium) available.
 
 ### Windows
 
@@ -79,26 +82,27 @@ The node also still allows access to the [message subsystem](#message-system).
 
 ## Configuration
 
-Mycelium can be started with an **optional** configuration file using the `--config-file` 
+Mycelium can be started with an **optional** configuration file using the `--config-file`
 option, which offers the same capabilities as the command line arguments.
 
-If no configuration file is specified with `--config-file`, Mycelium will search for one 
+If no configuration file is specified with `--config-file`, Mycelium will search for one
 in a default location based on the operating system:
-  - Linux: $HOME/.config/mycelium.toml
-  - Windows: %APPDATA%/ThreeFold Tech/Mycelium/mycelium.toml
-  - Mac OS: $HOME/Library/Application Support/ThreeFold Tech/Mycelium/mycelium.toml
+
+- Linux: $HOME/.config/mycelium.toml
+- Windows: %APPDATA%/ThreeFold Tech/Mycelium/mycelium.toml
+- Mac OS: $HOME/Library/Application Support/ThreeFold Tech/Mycelium/mycelium.toml
 
 Command line arguments will override any settings found in the configuration file.
 
-## Hosted public nodes
+## Hosted public nodes v0.6.x
 
 A couple of public nodes are provided, which can be freely connected to. This allows
-anyone to join the global network. These are hosted in 3 geographic regions, on both
-IPv4 and IPv6, and supporting both the Tcp and Quic protocols. The nodes are the
-following:
+anyone to join the global network. These are hosted in multiple geographic regions,
+on both IPv4 and IPv6, and supporting both the Tcp and Quic protocols. The nodes
+are the following:
 
 | Node ID | Region | IPv4 | IPv6 | Tcp port | Quic port | Mycelium IP |
-| --- | --- | --- | --- | --- | --- | --- |
+| ------- | ------- | -------------- | --------------------------------- | -------- | --------- | -------------------------------------- |
 | 01 | DE | 188.40.132.242 | 2a01:4f8:221:1e0b::2 | 9651 | 9651 | 54b:83ab:6cb5:7b38:44ae:cd14:53f3:a907 |
 | 02 | DE | 136.243.47.186 | 2a01:4f8:212:fa6::2 | 9651 | 9651 | 40a:152c:b85b:9646:5b71:d03a:eb27:2462 |
 | 03 | BE | 185.69.166.7 | 2a02:1802:5e:0:ec4:7aff:fe51:e80d | 9651 | 9651 | 597:a4ef:806:b09:6650:cbbf:1b68:cc94 |
@@ -148,10 +152,24 @@ tries to send (part of) the message, until it either succeeds, or the deadline e
 similar to the way TCP handles data. Messages are transmitted in chunks, which are embedded in the
 same data stream used by L3 packets. As such, intermediate nodes can't distinguish between regular L3
 and message data.
-
 The primary way to interact with the message system is through [the API](#api). The message API is
 documented in [an OpenAPI spec in the docs folder](docs/api.yaml). For some more info about how to
 use the message system, see [the message docs](/docs/message.md).
+
+Messages can be categorized by topics, which can be configured with whitelisted subnets and socket forwarding paths.
+For detailed information on how to configure topics, see the [Topic Configuration Guide](/docs/topic_configuration.md).
+use the message system, see [the message docs](/docs/message.md).
+
+## SOCKS5 Proxy
+
+Mycelium can expose a local SOCKS5 listener and forward all traffic to a remote SOCKS5 server running on a peer in the overlay. This enables applications to use a local proxy while the actual SOCKS handshake and traffic termination happen on the selected remote node.
+
+- Discovery: the node can probe peers for open SOCKS5 services on port 1080 (no-auth). Start/stop scanning via the API (startProxyProbe / stopProxyProbe).
+- Connect: choose the best discovered proxy automatically or connect to a specific remote with connectProxy(remote?).
+- Local listener: once connected, Mycelium binds [::]:1080 and proxies connections bidirectionally to the remote SOCKS5 server.
+- Disconnect: stop forwarding with disconnectProxy.
+
+See the detailed guide in [docs/proxy.md](docs/proxy.md). API references: [docs/api.yaml](docs/api.yaml) and [docs/openrpc.json](docs/openrpc.json).
 
 ## Inspecting node keys
 
@@ -209,6 +227,11 @@ Refer to the README files in those directories for more info.
 
 In case a release build is required, the `--release` flag can be added to the cargo
 command (`cargo build --release`).
+
+### Windows
+
+On windows, you need to have a copy of [`wintun.dll`](https://www.wintun.net/)
+available.
 
 ## Cross compilation
 

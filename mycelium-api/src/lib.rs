@@ -1,14 +1,19 @@
 use core::fmt;
-use std::{net::IpAddr, net::SocketAddr, str::FromStr, sync::Arc};
+use std::{
+    net::{IpAddr, Ipv6Addr, SocketAddr},
+    str::FromStr,
+    sync::Arc,
+};
 
 use axum::{
     extract::{Path, State},
     http::StatusCode,
+    response::IntoResponse,
     routing::{delete, get},
     Json, Router,
 };
 use serde::{de, Deserialize, Deserializer, Serialize};
-use tokio::sync::Mutex;
+use tokio::{sync::Mutex, time::Instant};
 use tracing::{debug, error};
 
 use mycelium::{
@@ -25,6 +30,11 @@ mod message;
 #[cfg(feature = "message")]
 pub use message::{MessageDestination, MessageReceiveInfo, MessageSendInfo, PushMessageResponse};
 
+pub use rpc::JsonRpc;
+
+// JSON-RPC API implementation
+pub mod rpc;
+
 /// Http API server handle. The server is spawned in a background task. If this handle is dropped,
 /// the server is terminated.
 pub struct Http {
@@ -35,26 +45,34 @@ pub struct Http {
 
 #[derive(Clone)]
 /// Shared state accessible in HTTP endpoint handlers.
-struct HttpServerState<M> {
+pub struct ServerState<M> {
     /// Access to the (`node`)(mycelium::Node) state.
-    node: Arc<Mutex<mycelium::Node<M>>>,
+    pub node: Arc<Mutex<mycelium::Node<M>>>,
 }
 
 impl Http {
     /// Spawns a new HTTP API server on the provided listening address.
-    pub fn spawn<M>(node: mycelium::Node<M>, listen_addr: SocketAddr) -> Self
+    pub fn spawn<M>(node: Arc<Mutex<mycelium::Node<M>>>, listen_addr: SocketAddr) -> Self
     where
         M: Metrics + Clone + Send + Sync + 'static,
     {
-        let server_state = HttpServerState {
-            node: Arc::new(Mutex::new(node)),
-        };
+        let server_state = ServerState { node };
         let admin_routes = Router::new()
             .route("/admin", get(get_info))
             .route("/admin/peers", get(get_peers).post(add_peer))
             .route("/admin/peers/{endpoint}", delete(delete_peer))
             .route("/admin/routes/selected", get(get_selected_routes))
             .route("/admin/routes/fallback", get(get_fallback_routes))
+            .route("/admin/routes/queried", get(get_queried_routes))
+            .route("/admin/routes/no_route", get(get_no_route_entries))
+            .route(
+                "/admin/proxy",
+                get(list_proxies)
+                    .post(connect_proxy)
+                    .delete(disconnect_proxy),
+            )
+            .route("/admin/proxy/probe", get(start_probe).delete(stop_probe))
+            .route("/admin/stats/packets", get(get_packet_statistics))
             .route("/pubkey/{ip}", get(get_pubk_from_ip))
             .with_state(server_state.clone());
         let app = Router::new().nest("/api/v1", admin_routes);
@@ -87,7 +105,7 @@ impl Http {
 }
 
 /// Get the stats of the current known peers
-async fn get_peers<M>(State(state): State<HttpServerState<M>>) -> Json<Vec<PeerStats>>
+async fn get_peers<M>(State(state): State<ServerState<M>>) -> Json<Vec<PeerStats>>
 where
     M: Metrics + Clone + Send + Sync + 'static,
 {
@@ -104,7 +122,7 @@ pub struct AddPeer {
 
 /// Add a new peer to the system
 async fn add_peer<M>(
-    State(state): State<HttpServerState<M>>,
+    State(state): State<ServerState<M>>,
     Json(payload): Json<AddPeer>,
 ) -> Result<StatusCode, (StatusCode, String)>
 where
@@ -130,7 +148,7 @@ where
 
 /// remove an existing peer from the system
 async fn delete_peer<M>(
-    State(state): State<HttpServerState<M>>,
+    State(state): State<ServerState<M>>,
     Path(endpoint): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)>
 where
@@ -177,7 +195,7 @@ pub struct Route {
 }
 
 /// List all currently selected routes.
-async fn get_selected_routes<M>(State(state): State<HttpServerState<M>>) -> Json<Vec<Route>>
+async fn get_selected_routes<M>(State(state): State<ServerState<M>>) -> Json<Vec<Route>>
 where
     M: Metrics + Clone + Send + Sync + 'static,
 {
@@ -204,7 +222,7 @@ where
 }
 
 /// List all active fallback routes.
-async fn get_fallback_routes<M>(State(state): State<HttpServerState<M>>) -> Json<Vec<Route>>
+async fn get_fallback_routes<M>(State(state): State<ServerState<M>>) -> Json<Vec<Route>>
 where
     M: Metrics + Clone + Send + Sync + 'static,
 {
@@ -230,8 +248,195 @@ where
     Json(routes)
 }
 
+/// Info about a queried subnet. This uses base types only to avoid having to introduce too
+/// many Serialize bounds in the core types.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, PartialOrd, Eq, Ord)]
+#[serde(rename_all = "camelCase")]
+pub struct QueriedSubnet {
+    /// We convert the [`subnet`](Subnet) to a string to avoid introducing a bound on the actual
+    /// type.
+    pub subnet: String,
+    /// The amount of time left before the query expires.
+    pub expiration: String,
+}
+
+async fn get_queried_routes<M>(State(state): State<ServerState<M>>) -> Json<Vec<QueriedSubnet>>
+where
+    M: Metrics + Clone + Send + Sync + 'static,
+{
+    debug!("Loading queried subnets");
+    let queries = state
+        .node
+        .lock()
+        .await
+        .queried_subnets()
+        .into_iter()
+        .map(|qs| QueriedSubnet {
+            subnet: qs.subnet().to_string(),
+            expiration: qs
+                .query_expires()
+                .duration_since(Instant::now())
+                .as_secs()
+                .to_string(),
+        })
+        .collect();
+
+    Json(queries)
+}
+
+/// Info about a subnet with no route. This uses base types only to avoid having to introduce too
+/// many Serialize bounds in the core types.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, PartialOrd, Eq, Ord)]
+#[serde(rename_all = "camelCase")]
+pub struct NoRouteSubnet {
+    /// We convert the [`subnet`](Subnet) to a string to avoid introducing a bound on the actual
+    /// type.
+    pub subnet: String,
+    /// The amount of time left before the query expires.
+    pub expiration: String,
+}
+
+async fn get_no_route_entries<M>(State(state): State<ServerState<M>>) -> Json<Vec<NoRouteSubnet>>
+where
+    M: Metrics + Clone + Send + Sync + 'static,
+{
+    debug!("Loading no-route subnets");
+    let queries = state
+        .node
+        .lock()
+        .await
+        .no_route_entries()
+        .into_iter()
+        .map(|nrs| NoRouteSubnet {
+            subnet: nrs.subnet().to_string(),
+            expiration: nrs
+                .entry_expires()
+                .duration_since(Instant::now())
+                .as_secs()
+                .to_string(),
+        })
+        .collect();
+
+    Json(queries)
+}
+
+/// Statistics for packets routed for a single IP address.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct PacketStatEntry {
+    /// IP address.
+    pub ip: String,
+    /// Number of packets routed.
+    pub packet_count: u64,
+    /// Total bytes routed.
+    pub byte_count: u64,
+}
+
+/// Packet statistics grouped by source and destination.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct PacketStatistics {
+    /// Statistics per source IP.
+    pub by_source: Vec<PacketStatEntry>,
+    /// Statistics per destination IP.
+    pub by_destination: Vec<PacketStatEntry>,
+}
+
+/// Get packet statistics grouped by source and destination IP.
+async fn get_packet_statistics<M>(State(state): State<ServerState<M>>) -> Json<PacketStatistics>
+where
+    M: Metrics + Clone + Send + Sync + 'static,
+{
+    debug!("Loading packet statistics");
+    let stats = state.node.lock().await.packet_statistics();
+
+    Json(PacketStatistics {
+        by_source: stats
+            .by_source
+            .into_iter()
+            .map(|ps| PacketStatEntry {
+                ip: ps.ip.to_string(),
+                packet_count: ps.packet_count,
+                byte_count: ps.byte_count,
+            })
+            .collect(),
+        by_destination: stats
+            .by_destination
+            .into_iter()
+            .map(|ps| PacketStatEntry {
+                ip: ps.ip.to_string(),
+                packet_count: ps.packet_count,
+                byte_count: ps.byte_count,
+            })
+            .collect(),
+    })
+}
+
+async fn list_proxies<M>(State(state): State<ServerState<M>>) -> Json<Vec<Ipv6Addr>>
+where
+    M: Metrics + Clone + Send + Sync + 'static,
+{
+    debug!("Listing known proxies");
+    Json(state.node.lock().await.known_proxies())
+}
+
+#[derive(Deserialize)]
+pub struct ConnectProxyInput {
+    remote: Option<SocketAddr>,
+}
+
+async fn connect_proxy<M>(
+    State(state): State<ServerState<M>>,
+    Json(ConnectProxyInput { remote }): Json<ConnectProxyInput>,
+) -> impl IntoResponse
+where
+    M: Metrics + Clone + Send + Sync + 'static,
+{
+    debug!("Attempting to connect remote proxy");
+    state
+        .node
+        .lock()
+        .await
+        .connect_proxy(remote)
+        .await
+        .map(Json)
+        // An error indicates we don't have a valid good auto discovered proxy -> No proxy no
+        // content
+        .map_err(|_| StatusCode::NOT_FOUND)
+}
+
+async fn disconnect_proxy<M>(State(state): State<ServerState<M>>) -> impl IntoResponse
+where
+    M: Metrics + Clone + Send + Sync + 'static,
+{
+    debug!("Disconnecting from connect remote proxy");
+    state.node.lock().await.disconnect_proxy();
+
+    StatusCode::NO_CONTENT
+}
+
+async fn start_probe<M>(State(state): State<ServerState<M>>) -> impl IntoResponse
+where
+    M: Metrics + Clone + Send + Sync + 'static,
+{
+    debug!("Starting proxy probe");
+    state.node.lock().await.start_proxy_scan();
+
+    StatusCode::NO_CONTENT
+}
+
+async fn stop_probe<M>(State(state): State<ServerState<M>>) -> impl IntoResponse
+where
+    M: Metrics + Clone + Send + Sync + 'static,
+{
+    debug!("Stopping proxy probe");
+    state.node.lock().await.stop_proxy_scan();
+
+    StatusCode::NO_CONTENT
+}
+
 /// General info about a node.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Info {
     /// The overlay subnet in use by the node.
@@ -241,7 +446,7 @@ pub struct Info {
 }
 
 /// Get general info about the node.
-async fn get_info<M>(State(state): State<HttpServerState<M>>) -> Json<Info>
+async fn get_info<M>(State(state): State<ServerState<M>>) -> Json<Info>
 where
     M: Metrics + Clone + Send + Sync + 'static,
 {
@@ -262,7 +467,7 @@ pub struct PubKey {
 
 /// Get public key from IP.
 async fn get_pubk_from_ip<M>(
-    State(state): State<HttpServerState<M>>,
+    State(state): State<ServerState<M>>,
     Path(ip): Path<IpAddr>,
 ) -> Result<Json<PubKey>, StatusCode>
 where
@@ -308,7 +513,7 @@ impl<'de> Deserialize<'de> for Metric {
                     INFINITE_STR => Ok(Metric::Infinite),
                     _ => Err(serde::de::Error::invalid_value(
                         serde::de::Unexpected::Str(value),
-                        &format!("expected '{}'", INFINITE_STR).as_str(),
+                        &format!("expected '{INFINITE_STR}'").as_str(),
                     )),
                 }
             }
@@ -334,8 +539,8 @@ impl<'de> Deserialize<'de> for Metric {
 impl fmt::Display for Metric {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Value(val) => write!(f, "{}", val),
-            Self::Infinite => write!(f, "{}", INFINITE_STR),
+            Self::Value(val) => write!(f, "{val}"),
+            Self::Infinite => write!(f, "{INFINITE_STR}"),
         }
     }
 }
@@ -358,7 +563,7 @@ mod tests {
         let metric = super::Metric::Infinite;
         let s = serde_json::to_string(&metric).expect("can encode infinite metric");
 
-        assert_eq!(format!("\"{}\"", INFINITE_STR), s);
+        assert_eq!(format!("\"{INFINITE_STR}\""), s);
     }
 
     #[test]

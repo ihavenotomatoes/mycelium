@@ -7,8 +7,139 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-02-09
+
+### Fixed
+
+- Pin wix version used in release flows for windows msi artifact to avoid version
+  incompatibilities.
+
+## [0.7.2] - 2026-02-09
+
+### Added
+
+- You can now limit peer discovery to specific interfaces by specifying the
+  `--peer-discovery-interface <interface_name>`. The flag can be specified multiple
+  times to allow multiple interfaces.
+- Track packets which have been handled by src IP and dst IP (separately). The
+  stats can be accessed through the API.
+- Active route requests are now sent to peers when they connect
+
 ### Changed
 
+- No longer block the router when a subnet is being queried until the query resolves
+  or times out.
+- Entries for subnets which did not resolve are now cleared after 5 seconds (down
+  from 60 seconds)
+- Route requests now have 15 seconds to resolve (up from 5 seconds), to increase
+  the chance of recovery after a spurious link issue
+
+## [0.7.1] - 2026-01-05
+
+### Added
+
+- Support Quic peers in the mobile wrapper crate.
+- Support HTTP API in the mobile wrapper crate.
+
+## [0.7.0] - 2025-12-08
+
+### Added
+
+- Optional DNS resolver. When enabled this will bind UDP port 53 on the system.
+  For now, this uses the system configured resolvers to resolve queries. In the
+  future, this will be expanded to redirect queries for certain TLD's to alternative
+  backend.
+
+### Changed
+
+- The Quic connection type now uses quic datagrams to transport **data** (packets
+  coming from the TUN device) to the peer. Protocol traffic is still sent over a
+  bidirectional Quic stream (which supports retransmits).
+
+### Fixed
+
+- Return actuall amount of bytes sent to peers instead of the amount of bytes received
+  from them.
+- Improve handling of completely local packets on MacOS. This will allow the kernel
+  to reply to ping packets send from the local system to the TUN interface, among
+  other things.
+- Fixed a potential system lock when sending messages to a (recently) offline receiver.
+
+## [0.6.2] - 2025-09-19
+
+**IMPORTANT**
+
+This release changes the default location of the private key used to derive the
+local IP address. If you upgrade to this version and want to keep your IP/subnet,
+and don't set the `-k/--key-file` flag, move your key file to the new default
+location or add the flag pointing to your existing key file.
+
+### Added
+
+- New log format option `plain`, this option is the same as logfmt, but with colors
+  always disabled.
+- Added auto discovery of Socks5 proxies on the overlay, and the ability to proxy
+  local Socks5 connections to a chosen (manual or automatic) remote.
+- New `generate-keys` subcommand which generates the key file without running a
+  daemon. It can also be used to generate fresh keys, should that be needed.
+
+### Changed
+
+- Default key path (which is used if the `--key-file` flag isn't set) is changed
+  to a fixed path on the system in application data, instead of the old local file.
+
+### Fixed
+
+- The RPC API now returns an empty result instead of an error when popMessage does
+  not have any message to return within the specified timeout.
+
+## [0.6.1] - 2025-05-14
+
+### Added
+
+- When a route is used which is about to expire, we now send a route request to
+  try and refresh its duration before it expires.
+- We now track when a peer was fist discovered and when we last connected to it.
+  This info is displayed in the CLI when listing peers.
+- We now maintain a cache of recently sent route requests, so we can avoid spamming
+  peers with duplicate requests.
+
+### Changed
+
+- Only keep a record of retracted routes for 6 seconds instead of 60. We'll track
+  how this affects the route propagation before removing this altogether.
+
+### Fixed
+
+- Fixed an unsoundness issue in the routing table clone implementation.
+- Clear dead peer buffer once peers have been removed from the routing table.
+- Properly reply with an address unreachable ICMP when pinging an IP in the local
+  subnet which does not exist.
+- Verify a packet has sufficient TTL to be routed before injecting it, and reply
+  with a TTL exceeded otherwise. This fixes an issue where packets with a TTL of
+  1 and 0 originating locally would not result in a proper ICMP reply. This happens
+  for instance when using `traceroute`.
+- Check the local seqno request cache before sending a seqno request to a peer,
+  to avoid spamming in certain occasions.
+- Don't accept packet for a destination if we only have fallback routes for said
+  destination.
+
+## [0.6.0] - 2025-04-25
+
+This is a breaking change, check the main README file for update info.
+
+### Added
+
+- Json-rpc based API, see the docs for more info.
+- Message forwarding to unix sockets if configured.
+- Config file support to handle messages, if this is enabled.
+
+### Changed
+
+- Routing has been reworked. We no longer advertise selected subnets (which aren't
+  our own). Now if a subnet is needed, we perform a route request for that subnet,
+  memorizing state and responses. The current imlementation expires routes every 5
+  minutes but does not yet refresh active routes before they expire.
 - Before we process a seqno request for a subnet, check the seqno cache to see if
   we recently forwarded an entry for it.
 - Discard Update TLV's if there are too many in the queue already. This binds memory
@@ -526,7 +657,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Remove trailing 'e' character from release archive names
 
-## \[0.1.0\] - 2023-11-15
+## [0.1.0] - 2023-11-15
 
 ### Added
 
@@ -559,4 +690,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.5.5]: https://github.com/threefoldtech/mycelium/compare/v0.5.4...v0.5.5
 [0.5.6]: https://github.com/threefoldtech/mycelium/compare/v0.5.5...v0.5.6
 [0.5.7]: https://github.com/threefoldtech/mycelium/compare/v0.5.6...v0.5.7
-[unreleased]: https://github.com/threefoldtech/mycelium/compare/v0.5.7...HEAD
+[0.6.0]: https://github.com/threefoldtech/mycelium/compare/v0.5.7...v0.6.0
+[0.6.1]: https://github.com/threefoldtech/mycelium/compare/v0.6.0...v0.6.1
+[0.6.2]: https://github.com/threefoldtech/mycelium/compare/v0.6.1...v0.6.2
+[0.7.0]: https://github.com/threefoldtech/mycelium/compare/v0.6.2...v0.7.0
+[0.7.1]: https://github.com/threefoldtech/mycelium/compare/v0.7.0...v0.7.1
+[0.7.2]: https://github.com/threefoldtech/mycelium/compare/v0.7.1...v0.7.2
+[0.7.3]: https://github.com/threefoldtech/mycelium/compare/v0.7.2...v0.7.3
+[unreleased]: https://github.com/threefoldtech/mycelium/compare/v0.7.3...HEAD

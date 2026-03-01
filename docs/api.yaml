@@ -1,21 +1,21 @@
 openapi: 3.0.2
 info:
-  version: '1.0.0' 
-  
+  version: "1.0.0"
+
   title: Mycelium management
   contact:
-    url: 'https://github.com/threefoldtech/mycelium'
+    url: "https://github.com/threefoldtech/mycelium"
   license:
     name: Apache 2.0
-    url: 'https://github.com/threefoldtech/mycelium/blob/master/LICENSE'
-  
+    url: "https://github.com/threefoldtech/mycelium/blob/master/LICENSE"
+
   description: |
     This is the specification of the **mycelium** management API. It is used to perform admin tasks on the system, and
     to perform administrative duties.
 
 externalDocs:
   description: For full documentation, check out the mycelium github repo.
-  url: 'https://github.com/threefoldtech/mycelium'
+  url: "https://github.com/threefoldtech/mycelium"
 
 tags:
   - name: Admin
@@ -24,14 +24,20 @@ tags:
     description: Operations related to peer management
   - name: Route
     description: Operations related to network routes
+  - name: Statistics
+    description: Operations related to packet statistics
   - name: Message
     description: Operations on the embedded message subsystem
+  - name: Topic
+    description: Operations related to message topic configuration
+  - name: Proxy
+    description: Operations related to proxy management
 
 servers:
-  - url: 'http://localhost:8989'
+  - url: "http://localhost:8989"
 
 paths:
-  '/api/v1/admin':
+  "/api/v1/admin":
     get:
       tags:
         - Admin
@@ -40,14 +46,14 @@ paths:
         Get general info about the node, which is not related to other more specific functionality
       operationId: getInfo
       responses:
-        '200':
+        "200":
           description: Success
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Info'
+                $ref: "#/components/schemas/Info"
 
-  '/api/v1/admin/peers':
+  "/api/v1/admin/peers":
     get:
       tags:
         - Admin
@@ -59,14 +65,14 @@ paths:
         of bytes we've sent to and received from the peer.
       operationId: getPeers
       responses:
-        '200':
+        "200":
           description: Success
           content:
             application/json:
               schema:
                 type: array
                 items:
-                  $ref: '#/components/schemas/PeerStats'
+                  $ref: "#/components/schemas/PeerStats"
     post:
       tags:
         - Admin
@@ -80,16 +86,16 @@ paths:
         later on.
       operationId: addPeer
       responses:
-        '204':
+        "204":
           description: Peer added
-        '400':
+        "400":
           description: Malformed endpoint
           content:
             text/plain:
               schema:
                 type: string
                 description: Details about why the endpoint is not valid
-        '409':
+        "409":
           description: Peer already exists
           content:
             text/plain:
@@ -97,7 +103,7 @@ paths:
                 type: string
                 description: message saying we already know this peer
 
-  '/api/v1/admin/peers/{endpoint}':
+  "/api/v1/admin/peers/{endpoint}":
     delete:
       tags:
         - Admin
@@ -109,16 +115,16 @@ paths:
         is currently active, it will be closed.
       operationId: deletePeer
       responses:
-        '204':
+        "204":
           description: Peer removed
-        '400':
+        "400":
           description: Malformed endpoint
           content:
             text/plain:
               schema:
                 type: string
                 description: Details about why the endpoint is not valid
-        '404':
+        "404":
           description: Peer doesn't exist
           content:
             text/plain:
@@ -126,7 +132,7 @@ paths:
                 type: string
                 description: message saying we don't know this peer
 
-  '/api/v1/admin/routes/selected':
+  "/api/v1/admin/routes/selected":
     get:
       tags:
         - Admin
@@ -137,16 +143,16 @@ paths:
         It is possible for a route to be selected and have an infinite metric. This route will however not forward packets.
       operationId: getSelectedRoutes
       responses:
-        '200':
+        "200":
           description: Success
           content:
             application/json:
               schema:
                 type: array
                 items:
-                  $ref: '#/components/schemas/Route'
+                  $ref: "#/components/schemas/Route"
 
-  '/api/v1/admin/routes/fallback':
+  "/api/v1/admin/routes/fallback":
     get:
       tags:
         - Admin
@@ -155,18 +161,156 @@ paths:
       description: |
         List all fallback routes in the system, and their next hop identifier, metric and sequence number.
         These routes are available to be selected in case the selected route for a destination suddenly fails, or gets retracted.
-      operationId: getSelectedRoutes
+      operationId: getFallbackRoutes
       responses:
-        '200':
+        "200":
           description: Success
           content:
             application/json:
               schema:
                 type: array
                 items:
-                  $ref: '#/components/schemas/Route'
+                  $ref: "#/components/schemas/Route"
 
-  '/api/v1/messages':
+  "/api/v1/admin/routes/queried":
+    get:
+      tags:
+        - Admin
+        - Route
+      summary: List all currently queried subnets
+      description: |
+        List all currently queried subnets in the system, and the amount of seconds until the query expires.
+        These subnets are actively being probed in the network. If no route to them is discovered before the query expires,
+        they will be marked as not reachable temporarily.
+      operationId: getQueriedSubnets
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/QueriedSubnet"
+
+  "/api/v1/admin/routes/no_route":
+    get:
+      tags:
+        - Admin
+        - Route
+      summary: List all subnets which are explicitly marked as no route
+      description: |
+        List all subnets in the system which are marked no route, and the amount of seconds until the query expires.
+        These subnets have recently been probed in the network, and no route for them was discovered in time. No more
+        route requests will be send for these subnets until the entry expires.
+      operationId: getNoRouteEntries
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/NoRouteSubnet"
+
+  "/api/v1/admin/proxy":
+    get:
+      tags:
+        - Admin
+        - Proxy
+      summary: List known proxies
+      description: |
+        List overlay IPv6 addresses of known proxies discovered by the node.
+      operationId: getProxies
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Ipv6Address"
+    post:
+      tags:
+        - Admin
+        - Proxy
+      summary: Connect to a proxy
+      description: |
+        Connect to a proxy. When no remote is provided, the node attempts to connect to the best known proxy.
+        When a remote is provided, it attempts to connect to that address.
+      operationId: connectProxy
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ConnectProxyRequest"
+      responses:
+        "200":
+          description: Connected to proxy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SocketAddr"
+        "404":
+          description: No valid proxy available or connection failed
+    delete:
+      tags:
+        - Admin
+        - Proxy
+      summary: Disconnect from the current proxy
+      description: |
+        Disconnect from the currently connected proxy if any.
+      operationId: disconnectProxy
+      responses:
+        "204":
+          description: Disconnected
+
+  "/api/v1/admin/proxy/probe":
+    get:
+      tags:
+        - Admin
+        - Proxy
+      summary: Start proxy probe
+      description: |
+        Start scanning/probing for proxies on the network.
+      operationId: startProxyProbe
+      responses:
+        "204":
+          description: Probe started
+    delete:
+      tags:
+        - Admin
+        - Proxy
+      summary: Stop proxy probe
+      description: |
+        Stop scanning/probing for proxies on the network.
+      operationId: stopProxyProbe
+      responses:
+        "204":
+          description: Probe stopped
+
+  "/api/v1/admin/stats/packets":
+    get:
+      tags:
+        - Admin
+        - Statistics
+      summary: Get packet statistics
+      description: |
+        Get packet statistics grouped by source and destination IP addresses.
+        Returns the number of packets and total bytes routed for each unique source IP
+        and each unique destination IP separately.
+      operationId: getPacketStatistics
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PacketStatistics"
+
+  "/api/v1/messages":
     get:
       tags:
         - Message
@@ -188,7 +332,7 @@ paths:
         - in: query
           name: timeout
           required: false
-          schema: 
+          schema:
             type: integer
             format: int64
             minimum: 0
@@ -197,25 +341,25 @@ paths:
             a message if present, or return immediately if there isn't
           example: 60
         - in: query
-          name: topic 
+          name: topic
           required: false
-          schema: 
-            type: string 
+          schema:
+            type: string
             format: byte
             minLength: 0
-            maxLength: 340 
+            maxLength: 340
           description: |
             Optional filter for loading messages. If set, the system checks if the message has the given string at the start. This way
             a topic can be encoded.
           example: example.topic
       responses:
-        '200':
+        "200":
           description: Message retrieved
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/InboundMessage'
-        '204':
+                $ref: "#/components/schemas/InboundMessage"
+        "204":
           description: No message ready
     post:
       tags:
@@ -229,7 +373,7 @@ paths:
         - in: query
           name: reply_timeout
           required: false
-          schema: 
+          schema:
             type: integer
             format: int64
             minimum: 0
@@ -242,29 +386,29 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/PushMessageBody'
+              $ref: "#/components/schemas/PushMessageBody"
       responses:
-        '200':
+        "200":
           description: We received a reply within the specified timeout
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/InboundMessage'
+                $ref: "#/components/schemas/InboundMessage"
 
-        '201':
+        "201":
           description: Message pushed successfully, and not waiting for a reply
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/PushMessageResponseId'
-        '408':
+                $ref: "#/components/schemas/PushMessageResponseId"
+        "408":
           description: The system timed out waiting for a reply to the message
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/PushMessageResponseId'
+                $ref: "#/components/schemas/PushMessageResponseId"
 
-  '/api/v1/messsages/reply/{id}':
+  "/api/v1/messages/reply/{id}":
     post:
       tags:
         - Message
@@ -272,7 +416,7 @@ paths:
       description: |
         Submits a reply message to the system, where ID is an id of a previously received message. If the sender is waiting
         for a reply, it will bypass the queue of open messages.
-      operationId: pushMessageReply 
+      operationId: pushMessageReply
       parameters:
         - in: path
           name: id
@@ -287,12 +431,12 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/PushMessageBody'
+              $ref: "#/components/schemas/PushMessageBody"
       responses:
-        '204':
+        "204":
           description: successfully submitted the reply
 
-  '/api/v1/messages/status/{id}':
+  "/api/v1/messages/status/{id}":
     get:
       tags:
         - Message
@@ -312,16 +456,271 @@ paths:
             maxLength: 16
           example: abcdef0123456789
       responses:
-        '200':
+        "200":
           description: Success
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/MessageStatusResponse'
-        '404':
+                $ref: "#/components/schemas/MessageStatusResponse"
+        "404":
           description: Message not found
-  
-  '/api/v1/pubkey/{mycelium_ip}':
+
+  "/api/v1/messages/topics/default":
+    get:
+      tags:
+        - Message
+        - Topic
+      summary: Get the default topic action
+      description: |
+        Get the default action for topics that are not explicitly configured (accept or reject).
+      operationId: getDefaultTopicAction
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DefaultTopicActionResponse"
+    put:
+      tags:
+        - Message
+        - Topic
+      summary: Set the default topic action
+      description: |
+        Set the default action for topics that are not explicitly configured (accept or reject).
+      operationId: setDefaultTopicAction
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DefaultTopicActionRequest"
+      responses:
+        "204":
+          description: Default topic action set successfully
+
+  "/api/v1/messages/topics":
+    get:
+      tags:
+        - Message
+        - Topic
+      summary: Get all configured topics
+      description: |
+        Get all topics that are explicitly configured in the system.
+      operationId: getTopics
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: string
+                  format: byte
+                  description: Base64 encoded topic identifier
+    post:
+      tags:
+        - Message
+        - Topic
+      summary: Add a new topic
+      description: |
+        Add a new topic to the system's whitelist.
+      operationId: addTopic
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: string
+              format: byte
+              description: The topic to add
+      responses:
+        "201":
+          description: Topic added successfully
+
+  "/api/v1/messages/topics/{topic}":
+    delete:
+      tags:
+        - Message
+        - Topic
+      summary: Remove a topic
+      description: |
+        Remove a topic from the system's whitelist.
+      operationId: removeTopic
+      parameters:
+        - in: path
+          name: topic
+          required: true
+          schema:
+            type: string
+            format: byte
+          description: The topic to remove (base64 encoded)
+      responses:
+        "204":
+          description: Topic removed successfully
+        "400":
+          description: Invalid topic format
+
+  "/api/v1/messages/topics/{topic}/sources":
+    get:
+      tags:
+        - Message
+        - Topic
+      summary: Get sources for a topic
+      description: |
+        Get all sources (subnets) that are allowed to send messages for a specific topic.
+      operationId: getTopicSources
+      parameters:
+        - in: path
+          name: topic
+          required: true
+          schema:
+            type: string
+            format: byte
+          description: The topic to get sources for (base64 encoded)
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: string
+                  description: Subnet in CIDR notation
+        "400":
+          description: Invalid topic format
+    post:
+      tags:
+        - Message
+        - Topic
+      summary: Add a source to a topic
+      description: |
+        Add a source (subnet) that is allowed to send messages for a specific topic.
+      operationId: addTopicSource
+      parameters:
+        - in: path
+          name: topic
+          required: true
+          schema:
+            type: string
+            format: byte
+          description: The topic to add a source to (base64 encoded)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TopicSourceRequest"
+      responses:
+        "204":
+          description: Source added successfully
+        "400":
+          description: Invalid topic format or subnet
+
+  "/api/v1/messages/topics/{topic}/sources/{subnet}":
+    delete:
+      tags:
+        - Message
+        - Topic
+      summary: Remove a source from a topic
+      description: |
+        Remove a source (subnet) that is allowed to send messages for a specific topic.
+      operationId: removeTopicSource
+      parameters:
+        - in: path
+          name: topic
+          required: true
+          schema:
+            type: string
+            format: byte
+          description: The topic to remove a source from (base64 encoded)
+        - in: path
+          name: subnet
+          required: true
+          schema:
+            type: string
+          description: The subnet to remove as a source
+      responses:
+        "204":
+          description: Source removed successfully
+        "400":
+          description: Invalid topic format or subnet
+
+  "/api/v1/messages/topics/{topic}/forward":
+    get:
+      tags:
+        - Message
+        - Topic
+      summary: Get the forward socket for a topic
+      description: |
+        Get the socket path where messages for a specific topic are forwarded to.
+      operationId: getTopicForwardSocket
+      parameters:
+        - in: path
+          name: topic
+          required: true
+          schema:
+            type: string
+            format: byte
+          description: The topic to get the forward socket for (base64 encoded)
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: string
+                nullable: true
+                description: The socket path where messages are forwarded to
+        "400":
+          description: Invalid topic format
+    put:
+      tags:
+        - Message
+        - Topic
+      summary: Set the forward socket for a topic
+      description: |
+        Set the socket path where messages for a specific topic should be forwarded to.
+      operationId: setTopicForwardSocket
+      parameters:
+        - in: path
+          name: topic
+          required: true
+          schema:
+            type: string
+            format: byte
+          description: The topic to set the forward socket for (base64 encoded)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TopicForwardSocketRequest"
+      responses:
+        "204":
+          description: Forward socket set successfully
+        "400":
+          description: Invalid topic format
+    delete:
+      tags:
+        - Message
+        - Topic
+      summary: Remove the forward socket for a topic
+      description: |
+        Remove the socket path where messages for a specific topic are forwarded to.
+      operationId: removeTopicForwardSocket
+      parameters:
+        - in: path
+          name: topic
+          required: true
+          schema:
+            type: string
+            format: byte
+          description: The topic to remove the forward socket for (base64 encoded)
+      responses:
+        "204":
+          description: Forward socket removed successfully
+        "400":
+          description: Invalid topic format
+  "/api/v1/pubkey/{mycelium_ip}":
     get:
       summary: Get the pubkey from node ip
       description: |
@@ -336,15 +735,14 @@ paths:
             format: ipv6
             example: 5fd:7636:b80:9ad0::1
       responses:
-        '200':
+        "200":
           description: Success
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/PublicKeyResponse'
-        '404':
+                $ref: "#/components/schemas/PublicKeyResponse"
+        "404":
           description: Public key not found
-
 
 components:
   schemas:
@@ -356,6 +754,50 @@ components:
           description: The subnet owned by the node and advertised to peers
           type: string
           example: 54f:b680:ba6e:7ced::/64
+        nodePubkey:
+          description: The public key of the node
+          type: string
+          format: hex
+          minLength: 64
+          maxLength: 64
+          example: 02468ace13579bdf02468ace13579bdf02468ace13579bdf02468ace13579bdf
+
+    PacketStatEntry:
+      description: Statistics for packets routed for a single IP address
+      type: object
+      properties:
+        ip:
+          description: The IP address
+          type: string
+          format: ipv6
+          example: "469:1348:ab0c:a1d8::1"
+        packetCount:
+          description: Number of packets routed
+          type: integer
+          format: int64
+          minimum: 0
+          example: 1234
+        byteCount:
+          description: Total bytes routed
+          type: integer
+          format: int64
+          minimum: 0
+          example: 567890
+
+    PacketStatistics:
+      description: Packet statistics grouped by source and destination IP
+      type: object
+      properties:
+        bySource:
+          description: Statistics per source IP address
+          type: array
+          items:
+            $ref: "#/components/schemas/PacketStatEntry"
+        byDestination:
+          description: Statistics per destination IP address
+          type: array
+          items:
+            $ref: "#/components/schemas/PacketStatEntry"
 
     Endpoint:
       description: Identification to connect to a peer
@@ -365,8 +807,8 @@ components:
           description: Protocol used
           type: string
           enum:
-            - 'tcp'
-            - 'quic'
+            - "tcp"
+            - "quic"
           example: tcp
         socketAddr:
           description: The socket address used
@@ -378,22 +820,22 @@ components:
       type: object
       properties:
         endpoint:
-          $ref: '#/components/schemas/Endpoint'
+          $ref: "#/components/schemas/Endpoint"
         type:
           description: How we know about this peer
           type: string
           enum:
-            - 'static'
-            - 'inbound'
-            - 'linkLocalDiscovery'
+            - "static"
+            - "inbound"
+            - "linkLocalDiscovery"
           example: static
         connectionState:
           description: The current state of the connection to the peer
           type: string
           enum:
-            - 'alive'
-            - 'connecting'
-            - 'dead'
+            - "alive"
+            - "connecting"
+            - "dead"
           example: alive
         txBytes:
           description: The amount of bytes transmitted to this peer
@@ -439,6 +881,32 @@ components:
           minimum: 0
           maximum: 65535
           example: 1
+
+    QueriedSubnet:
+      description: Information about a subnet currently being queried
+      type: object
+      properties:
+        subnet:
+          description: The overlay subnet which we are currently querying
+          type: string
+          example: 503:5478:df06:d79a::/64
+        expiration:
+          description: The amount of seconds until the query expires
+          type: string
+          example: "37"
+
+    NoRouteSubnet:
+      description: Information about a subnet which is marked as no route
+      type: object
+      properties:
+        subnet:
+          description: The overlay subnet which is marked
+          type: string
+          example: 503:5478:df06:d79a::/64
+        expiration:
+          description: The amount of seconds until the entry expires
+          type: string
+          example: "37"
 
     InboundMessage:
       description: A message received by the system
@@ -493,7 +961,7 @@ components:
       type: object
       properties:
         dst:
-          $ref: '#/components/schemas/MessageDestination'
+          $ref: "#/components/schemas/MessageDestination"
         topic:
           description: An optional message topic
           type: string
@@ -510,7 +978,7 @@ components:
     MessageDestination:
       oneOf:
         - description: An IP in the subnet of the receiver node
-          type: object 
+          type: object
           properties:
             ip:
               description: The target IP of the message
@@ -547,8 +1015,8 @@ components:
           type: string
           format: ipv6
           example: 449:abcd:0123:defa::1
-        state: 
-          $ref: '#/components/schemas/TransmissionState'
+        state:
+          $ref: "#/components/schemas/TransmissionState"
         created:
           description: Unix timestamp of when this message was created
           type: integer
@@ -569,8 +1037,8 @@ components:
       description: The state of an outbound message in it's lifetime
       oneOf:
         - type: string
-          enum: ['pending', 'received', 'read', 'aborted']
-          example: 'received'
+          enum: ["pending", "received", "read", "aborted"]
+          example: "received"
         - type: object
           properties:
             sending:
@@ -588,10 +1056,10 @@ components:
                   type: integer
                   minimum: 0
                   example: 3
-      example: 'received'
+      example: "received"
 
     PublicKeyResponse:
-      description: Public key requested based on a node's IP 
+      description: Public key requested based on a node's IP
       type: object
       properties:
         NodePubKey:
@@ -600,3 +1068,81 @@ components:
           minLength: 64
           maxLength: 64
           example: 02468ace13579bdf02468ace13579bdf02468ace13579bdf02468ace13579bdf
+
+    DefaultTopicActionResponse:
+      description: Response for the default topic action
+      type: object
+      properties:
+        accept:
+          description: Whether unconfigured topics are accepted by default
+          type: boolean
+          example: true
+
+    DefaultTopicActionRequest:
+      description: Request to set the default topic action
+      type: object
+      properties:
+        accept:
+          description: Whether to accept unconfigured topics by default
+          type: boolean
+          example: true
+
+    TopicInfo:
+      description: Information about a configured topic
+      type: object
+      properties:
+        topic:
+          description: The topic identifier (base64 encoded)
+          type: string
+          format: byte
+          example: "ZXhhbXBsZS50b3BpYw=="
+        sources:
+          description: List of subnets that are allowed to send messages for this topic
+          type: array
+          items:
+            type: string
+            example: "503:5478:df06:d79a::/64"
+        forward_socket:
+          description: Optional socket path where messages for this topic are forwarded to
+          type: string
+          nullable: true
+          example: "/var/run/mycelium/topic_socket"
+
+    TopicSourceRequest:
+      description: Request to add a source to a topic whitelist
+      type: object
+      properties:
+        subnet:
+          description: The subnet to add as a source in CIDR notation
+          type: string
+          example: "503:5478:df06:d79a::/64"
+
+    TopicForwardSocketRequest:
+      description: Request to set a forward socket for a topic
+      type: object
+      properties:
+        socket_path:
+          description: The socket path where messages should be forwarded to
+          type: string
+          example: "/var/run/mycelium/topic_socket"
+
+    Ipv6Address:
+      description: IPv6 address in the overlay
+      type: string
+      format: ipv6
+      example: "5fd:7636:b80:9ad0::1"
+
+    SocketAddr:
+      description: Network socket address in the form host:port or [IPv6]:port
+      type: string
+      example: "[2a01:4f8:212:fa6::2]:9651"
+
+    ConnectProxyRequest:
+      description: Request body for connecting to a proxy
+      type: object
+      properties:
+        remote:
+          description: Optional remote socket address of the proxy to connect to. If omitted, the node will attempt to connect to the best known proxy.
+          type: string
+          nullable: true
+          example: "[2a01:4f8:212:fa6::2]:9651"

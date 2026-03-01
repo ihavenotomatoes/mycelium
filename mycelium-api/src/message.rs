@@ -3,7 +3,7 @@ use std::{net::IpAddr, ops::Deref, time::Duration};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -13,15 +13,17 @@ use mycelium::{
     crypto::PublicKey,
     message::{MessageId, MessageInfo},
     metrics::Metrics,
+    subnet::Subnet,
 };
+use std::path::PathBuf;
 
-use super::HttpServerState;
+use super::ServerState;
 
 /// Default amount of time to try and send a message if it is not explicitly specified.
 const DEFAULT_MESSAGE_TRY_DURATION: Duration = Duration::from_secs(60 * 5);
 
 /// Return a router which has message endpoints and their handlers mounted.
-pub fn message_router_v1<M>(server_state: HttpServerState<M>) -> Router
+pub fn message_router_v1<M>(server_state: ServerState<M>) -> Router
 where
     M: Metrics + Clone + Send + Sync + 'static,
 {
@@ -29,10 +31,31 @@ where
         .route("/messages", get(get_message).post(push_message))
         .route("/messages/status/{id}", get(message_status))
         .route("/messages/reply/{id}", post(reply_message))
+        // Topic configuration endpoints
+        .route(
+            "/messages/topics/default",
+            get(get_default_topic_action).put(set_default_topic_action),
+        )
+        .route("/messages/topics", get(get_topics).post(add_topic))
+        .route("/messages/topics/{topic}", delete(remove_topic))
+        .route(
+            "/messages/topics/{topic}/sources",
+            get(get_topic_sources).post(add_topic_source),
+        )
+        .route(
+            "/messages/topics/{topic}/sources/{subnet}",
+            delete(remove_topic_source),
+        )
+        .route(
+            "/messages/topics/{topic}/forward",
+            get(get_topic_forward_socket)
+                .put(set_topic_forward_socket)
+                .delete(remove_topic_forward_socket),
+        )
         .with_state(server_state)
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageSendInfo {
     pub dst: MessageDestination,
@@ -44,14 +67,14 @@ pub struct MessageSendInfo {
     pub payload: Vec<u8>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum MessageDestination {
     Ip(IpAddr),
     Pk(PublicKey),
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageReceiveInfo {
     pub id: MessageId,
@@ -101,7 +124,7 @@ impl GetMessageQuery {
 }
 
 async fn get_message<M>(
-    State(state): State<HttpServerState<M>>,
+    State(state): State<ServerState<M>>,
     Query(query): Query<GetMessageQuery>,
 ) -> Result<Json<MessageReceiveInfo>, StatusCode>
 where
@@ -143,13 +166,13 @@ where
     })
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageIdReply {
-    id: MessageId,
+    pub id: MessageId,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(untagged)]
 pub enum PushMessageResponse {
@@ -157,7 +180,7 @@ pub enum PushMessageResponse {
     Id(MessageIdReply),
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct PushMessageQuery {
     reply_timeout: Option<u64>,
 }
@@ -175,7 +198,7 @@ impl PushMessageQuery {
 }
 
 async fn push_message<M>(
-    State(state): State<HttpServerState<M>>,
+    State(state): State<ServerState<M>>,
     Query(query): Query<PushMessageQuery>,
     Json(message_info): Json<MessageSendInfo>,
 ) -> Result<(StatusCode, Json<PushMessageResponse>), StatusCode>
@@ -186,7 +209,7 @@ where
     debug!(
         message.dst=%dst,
         message.len=message_info.payload.len(),
-        "Pushing new reply to message stack",
+        "Pushing new message to stack",
     );
 
     let (id, sub) = match state.node.lock().await.push_message(
@@ -244,7 +267,7 @@ where
 }
 
 async fn reply_message<M>(
-    State(state): State<HttpServerState<M>>,
+    State(state): State<ServerState<M>>,
     Path(id): Path<MessageId>,
     Json(message_info): Json<MessageSendInfo>,
 ) -> StatusCode
@@ -270,7 +293,7 @@ where
 }
 
 async fn message_status<M>(
-    State(state): State<HttpServerState<M>>,
+    State(state): State<ServerState<M>>,
     Path(id): Path<MessageId>,
 ) -> Result<Json<MessageInfo>, StatusCode>
 where
@@ -291,13 +314,21 @@ where
 /// Sourced from https://users.rust-lang.org/t/serialize-a-vec-u8-to-json-as-base64/57781, with some
 /// addaptions to work with the new version of the base64 crate
 mod base64 {
-    use base64::alphabet;
     use base64::engine::{GeneralPurpose, GeneralPurposeConfig};
+    use base64::{alphabet, Engine};
 
     const B64ENGINE: GeneralPurpose = base64::engine::general_purpose::GeneralPurpose::new(
         &alphabet::STANDARD,
         GeneralPurposeConfig::new(),
     );
+
+    pub fn encode(input: &[u8]) -> String {
+        B64ENGINE.encode(input)
+    }
+
+    pub fn decode(input: &[u8]) -> Result<Vec<u8>, base64::DecodeError> {
+        B64ENGINE.decode(input)
+    }
 
     pub mod binary {
         use super::B64ENGINE;
@@ -344,4 +375,278 @@ mod base64 {
             }
         }
     }
+}
+
+// Topic configuration API
+
+/// Response for the default topic action
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DefaultTopicActionResponse {
+    accept: bool,
+}
+
+/// Request to set the default topic action
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DefaultTopicActionRequest {
+    accept: bool,
+}
+
+/// Request to add a source to a topic whitelist
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TopicSourceRequest {
+    subnet: String,
+}
+
+/// Request to set a forward socket for a topic
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TopicForwardSocketRequest {
+    socket_path: String,
+}
+
+/// Get the default topic action (accept or reject)
+async fn get_default_topic_action<M>(
+    State(state): State<ServerState<M>>,
+) -> Json<DefaultTopicActionResponse>
+where
+    M: Metrics + Clone + Send + Sync + 'static,
+{
+    debug!("Getting default topic action");
+    let accept = state.node.lock().await.unconfigure_topic_action();
+    Json(DefaultTopicActionResponse { accept })
+}
+
+/// Set the default topic action (accept or reject)
+async fn set_default_topic_action<M>(
+    State(state): State<ServerState<M>>,
+    Json(request): Json<DefaultTopicActionRequest>,
+) -> StatusCode
+where
+    M: Metrics + Clone + Send + Sync + 'static,
+{
+    debug!(accept=%request.accept, "Setting default topic action");
+    state
+        .node
+        .lock()
+        .await
+        .accept_unconfigured_topic(request.accept);
+    StatusCode::NO_CONTENT
+}
+
+/// Get all whitelisted topics
+async fn get_topics<M>(State(state): State<ServerState<M>>) -> Json<Vec<String>>
+where
+    M: Metrics + Clone + Send + Sync + 'static,
+{
+    debug!("Getting all whitelisted topics");
+    let node = state.node.lock().await;
+
+    // Get the whitelist from the node
+    let topics = node.topics();
+
+    // Convert to TopicInfo structs
+    let topics: Vec<String> = topics.iter().map(|topic| base64::encode(topic)).collect();
+
+    Json(topics)
+}
+
+/// Add a topic to the whitelist
+async fn add_topic<M>(
+    State(state): State<ServerState<M>>,
+    Json(topic_info): Json<Vec<u8>>,
+) -> StatusCode
+where
+    M: Metrics + Clone + Send + Sync + 'static,
+{
+    debug!("Adding topic to whitelist");
+    state.node.lock().await.add_topic_whitelist(topic_info);
+    StatusCode::CREATED
+}
+
+/// Remove a topic from the whitelist
+async fn remove_topic<M>(
+    State(state): State<ServerState<M>>,
+    Path(topic): Path<String>,
+) -> Result<StatusCode, StatusCode>
+where
+    M: Metrics + Clone + Send + Sync + 'static,
+{
+    debug!("Removing topic from whitelist");
+
+    // Decode the base64 topic
+    let topic_bytes = match base64::decode(topic.as_bytes()) {
+        Ok(bytes) => bytes,
+        Err(_) => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    state.node.lock().await.remove_topic_whitelist(topic_bytes);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Get all sources for a topic
+async fn get_topic_sources<M>(
+    State(state): State<ServerState<M>>,
+    Path(topic): Path<String>,
+) -> Result<Json<Vec<String>>, StatusCode>
+where
+    M: Metrics + Clone + Send + Sync + 'static,
+{
+    debug!("Getting sources for topic");
+
+    // Decode the base64 topic
+    let topic_bytes = match base64::decode(topic.as_bytes()) {
+        Ok(bytes) => bytes,
+        Err(_) => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    let node = state.node.lock().await;
+
+    // Get the whitelist from the node
+    let sources = node.topic_allowed_sources(&topic_bytes);
+
+    // Find the topic in the whitelist
+    if let Some(sources) = sources {
+        let sources = sources.into_iter().map(|s| s.to_string()).collect();
+        Ok(Json(sources))
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+/// Add a source to a topic whitelist
+async fn add_topic_source<M>(
+    State(state): State<ServerState<M>>,
+    Path(topic): Path<String>,
+    Json(request): Json<TopicSourceRequest>,
+) -> Result<StatusCode, StatusCode>
+where
+    M: Metrics + Clone + Send + Sync + 'static,
+{
+    debug!("Adding source to topic whitelist");
+
+    // Decode the base64 topic
+    let topic_bytes = match base64::decode(topic.as_bytes()) {
+        Ok(bytes) => bytes,
+        Err(_) => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    // Parse the subnet
+    let subnet = match request.subnet.parse::<Subnet>() {
+        Ok(subnet) => subnet,
+        Err(_) => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    state
+        .node
+        .lock()
+        .await
+        .add_topic_whitelist_src(topic_bytes, subnet);
+    Ok(StatusCode::CREATED)
+}
+
+/// Remove a source from a topic whitelist
+async fn remove_topic_source<M>(
+    State(state): State<ServerState<M>>,
+    Path((topic, subnet_str)): Path<(String, String)>,
+) -> Result<StatusCode, StatusCode>
+where
+    M: Metrics + Clone + Send + Sync + 'static,
+{
+    debug!("Removing source from topic whitelist");
+
+    // Decode the base64 topic
+    let topic_bytes = match base64::decode(topic.as_bytes()) {
+        Ok(bytes) => bytes,
+        Err(_) => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    // Parse the subnet
+    let subnet = match subnet_str.parse::<Subnet>() {
+        Ok(subnet) => subnet,
+        Err(_) => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    state
+        .node
+        .lock()
+        .await
+        .remove_topic_whitelist_src(topic_bytes, subnet);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Get the forward socket for a topic
+async fn get_topic_forward_socket<M>(
+    State(state): State<ServerState<M>>,
+    Path(topic): Path<String>,
+) -> Result<Json<Option<String>>, StatusCode>
+where
+    M: Metrics + Clone + Send + Sync + 'static,
+{
+    debug!("Getting forward socket for topic");
+
+    // Decode the base64 topic
+    let topic_bytes = match base64::decode(topic.as_bytes()) {
+        Ok(bytes) => bytes,
+        Err(_) => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    let node = state.node.lock().await;
+    let socket_path = node
+        .get_topic_forward_socket(&topic_bytes)
+        .map(|p| p.to_string_lossy().to_string());
+
+    Ok(Json(socket_path))
+}
+
+/// Set the forward socket for a topic
+async fn set_topic_forward_socket<M>(
+    State(state): State<ServerState<M>>,
+    Path(topic): Path<String>,
+    Json(request): Json<TopicForwardSocketRequest>,
+) -> Result<StatusCode, StatusCode>
+where
+    M: Metrics + Clone + Send + Sync + 'static,
+{
+    debug!("Setting forward socket for topic");
+
+    // Decode the base64 topic
+    let topic_bytes = match base64::decode(topic.as_bytes()) {
+        Ok(bytes) => bytes,
+        Err(_) => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    let socket_path = PathBuf::from(request.socket_path);
+    state
+        .node
+        .lock()
+        .await
+        .set_topic_forward_socket(topic_bytes, socket_path);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Remove the forward socket for a topic
+async fn remove_topic_forward_socket<M>(
+    State(state): State<ServerState<M>>,
+    Path(topic): Path<String>,
+) -> Result<StatusCode, StatusCode>
+where
+    M: Metrics + Clone + Send + Sync + 'static,
+{
+    debug!("Removing forward socket for topic");
+
+    // Decode the base64 topic
+    let topic_bytes = match base64::decode(topic.as_bytes()) {
+        Ok(bytes) => bytes,
+        Err(_) => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    state
+        .node
+        .lock()
+        .await
+        .delete_topic_forward_socket(topic_bytes);
+    Ok(StatusCode::NO_CONTENT)
 }

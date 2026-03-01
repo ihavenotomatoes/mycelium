@@ -1,25 +1,35 @@
-use std::net::{IpAddr, Ipv6Addr};
+use std::future::Future;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::path::PathBuf;
 #[cfg(feature = "message")]
-use std::{future::Future, time::Duration};
+use std::time::Duration;
 
+use crate::cdn::Cdn;
+use crate::packet_queue::IncomingPacketQueue;
+use crate::proxy::{ConnectionError, Proxy};
 use crate::tun::TunConfig;
 use bytes::BytesMut;
 use data::DataPlane;
 use endpoint::Endpoint;
 #[cfg(feature = "message")]
+use message::TopicConfig;
+#[cfg(feature = "message")]
 use message::{
     MessageId, MessageInfo, MessagePushResponse, MessageStack, PushMessageError, ReceivedMessage,
 };
 use metrics::Metrics;
-use peer_manager::{PeerExists, PeerNotFound, PeerStats, PrivateNetworkKey};
-use routing_table::RouteEntry;
+use peer_manager::{PeerDiscoveryMode, PeerExists, PeerNotFound, PeerStats, PrivateNetworkKey};
+use routing_table::{NoRouteSubnet, QueriedSubnet, RouteEntry};
 use subnet::Subnet;
+use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
 mod babel;
+pub mod cdn;
 mod connection;
 pub mod crypto;
 pub mod data;
+mod dns;
 pub mod endpoint;
 pub mod filters;
 mod interval;
@@ -28,11 +38,14 @@ pub mod message;
 mod metric;
 pub mod metrics;
 pub mod packet;
+mod packet_queue;
 mod peer;
 pub mod peer_manager;
+mod proxy;
 pub mod router;
 mod router_id;
 mod routing_table;
+mod rr_cache;
 mod seqno_cache;
 mod sequence_number;
 mod source_table;
@@ -58,7 +71,9 @@ pub struct Config<M> {
     /// Listen port for Quic connections.
     pub quic_listen_port: Option<u16>,
     /// Udp port for peer discovery.
-    pub peer_discovery_port: Option<u16>,
+    pub peer_discovery_port: u16,
+    /// Mode for peer discovery (All, Disabled, or Filtered).
+    pub peer_discovery_mode: PeerDiscoveryMode,
     /// Name for the TUN device.
     #[cfg(any(
         target_os = "linux",
@@ -92,12 +107,24 @@ pub struct Config<M> {
     /// set this to a value which is higher than the amount of logical CPU cores available to the
     /// system.
     pub update_workers: usize,
+
+    pub cdn_cache: Option<PathBuf>,
+
+    /// Enable dns resolver. This binds to port 53
+    pub enable_dns: bool,
+
+    /// Configuration for message topics, if this is not set the default config will be used.
+    #[cfg(feature = "message")]
+    pub topic_config: Option<TopicConfig>,
 }
 
 /// The Node is the main structure in mycelium. It governs the entire data flow.
 pub struct Node<M> {
     router: router::Router<M>,
     peer_manager: peer_manager::PeerManager<M>,
+    _dns: Option<dns::Resolver>,
+    _cdn: Option<Cdn>,
+    proxy: Proxy<M>,
     #[cfg(feature = "message")]
     message_stack: message::MessageStack<M>,
 }
@@ -141,34 +168,43 @@ where
         .expect("64 is a valid IPv6 prefix size; qed");
 
         // Creating a new Router instance
-        let router = match router::Router::new(
-            config.update_workers,
-            tun_tx,
-            node_subnet,
-            vec![node_subnet],
-            (config.node_key, node_pub_key),
-            vec![
-                Box::new(filters::AllowedSubnet::new(
-                    Subnet::new(GLOBAL_SUBNET_ADDRESS, GLOBAL_SUBNET_PREFIX_LEN)
-                        .expect("Global subnet is properly defined; qed"),
-                )),
-                Box::new(filters::MaxSubnetSize::<64>),
-                Box::new(filters::RouterIdOwnsSubnet),
-            ],
-            config.metrics.clone(),
-        ) {
-            Ok(router) => {
-                info!(
-                    "Router created. Pubkey: {:x}",
-                    BytesMut::from(&router.node_public_key().as_bytes()[..])
-                );
-                router
-            }
-            Err(e) => {
-                error!("Error creating router: {e}");
-                panic!("Error creating router: {e}");
-            }
-        };
+        let (router, pending_packet_rx, timeout_packet_rx, incoming_route_rx) =
+            match router::Router::new(
+                config.update_workers,
+                tun_tx,
+                node_subnet,
+                vec![node_subnet],
+                (config.node_key, node_pub_key),
+                vec![
+                    Box::new(filters::AllowedSubnet::new(
+                        Subnet::new(GLOBAL_SUBNET_ADDRESS, GLOBAL_SUBNET_PREFIX_LEN)
+                            .expect("Global subnet is properly defined; qed"),
+                    )),
+                    Box::new(filters::MaxSubnetSize::<64>),
+                    Box::new(filters::RouterIdOwnsSubnet),
+                ],
+                config.metrics.clone(),
+            ) {
+                Ok((router, pending_packet_rx, timeout_packet_rx, incoming_route_rx)) => {
+                    info!(
+                        "Router created. Pubkey: {:x}",
+                        BytesMut::from(&router.node_public_key().as_bytes()[..])
+                    );
+                    (
+                        router,
+                        pending_packet_rx,
+                        timeout_packet_rx,
+                        incoming_route_rx,
+                    )
+                }
+                Err(e) => {
+                    error!("Error creating router: {e}");
+                    panic!("Error creating router: {e}");
+                }
+            };
+
+        // Create the incoming packet queue for packets waiting for sender's route
+        let incoming_packet_queue = IncomingPacketQueue::new();
 
         // Creating a new PeerManager instance
         let pm = peer_manager::PeerManager::new(
@@ -176,8 +212,8 @@ where
             config.peers,
             config.tcp_listen_port,
             config.quic_listen_port,
-            config.peer_discovery_port.unwrap_or_default(),
-            config.peer_discovery_port.is_none(),
+            config.peer_discovery_port,
+            config.peer_discovery_mode,
             config.private_network_config,
             config.metrics,
             config.firewall_mark,
@@ -203,6 +239,10 @@ where
                 futures::sink::drain(),
                 msg_sender,
                 tun_rx,
+                pending_packet_rx,
+                timeout_packet_rx,
+                incoming_packet_queue,
+                incoming_route_rx,
             )
         } else {
             #[cfg(not(any(
@@ -247,16 +287,43 @@ where
                 let (rxhalf, txhalf) = tun::new(tun_config).await?;
 
                 info!("Node overlay IP: {node_addr}");
-                DataPlane::new(router.clone(), rxhalf, txhalf, msg_sender, tun_rx)
+                DataPlane::new(
+                    router.clone(),
+                    rxhalf,
+                    txhalf,
+                    msg_sender,
+                    tun_rx,
+                    pending_packet_rx,
+                    timeout_packet_rx,
+                    incoming_packet_queue,
+                    incoming_route_rx,
+                )
             }
         };
 
+        let dns = if config.enable_dns {
+            Some(dns::Resolver::new(router.clone()).await)
+        } else {
+            None
+        };
+
+        let cdn = config.cdn_cache.map(Cdn::new);
+        if let Some(ref cdn) = cdn {
+            let listener = TcpListener::bind("localhost:80").await?;
+            cdn.start(listener)?;
+        }
+
+        let proxy = Proxy::new(router.clone());
+
         #[cfg(feature = "message")]
-        let ms = MessageStack::new(_data_plane, msg_receiver);
+        let ms = MessageStack::new(_data_plane, msg_receiver, config.topic_config);
 
         Ok(Node {
             router,
             peer_manager: pm,
+            _dns: dns,
+            _cdn: cdn,
+            proxy,
             #[cfg(feature = "message")]
             message_stack: ms,
         })
@@ -295,9 +362,59 @@ where
         self.router.load_fallback_routes()
     }
 
+    /// List all [`queried subnets`](QueriedSubnet) in the system.
+    pub fn queried_subnets(&self) -> Vec<QueriedSubnet> {
+        self.router.load_queried_subnets()
+    }
+
+    /// List all [`subnets with no route`](NoRouteSubnet) in the system.
+    pub fn no_route_entries(&self) -> Vec<NoRouteSubnet> {
+        self.router.load_no_route_entries()
+    }
+
     /// Get public key from the IP of `Node`
     pub fn get_pubkey_from_ip(&self, ip: IpAddr) -> Option<crypto::PublicKey> {
         self.router.get_pubkey(ip)
+    }
+
+    /// Get packet statistics grouped by source and destination IP.
+    pub fn packet_statistics(&self) -> router::PacketStatistics {
+        self.router.packet_statistics()
+    }
+}
+
+impl<M> Node<M>
+where
+    M: Metrics + Clone + Send + Sync + 'static,
+{
+    /// Starts probing for Socks5 proxies on the network
+    pub fn start_proxy_scan(&self) {
+        self.proxy.start_probing()
+    }
+
+    /// Stops any ongoing Socks5 proxy probes on the network
+    pub fn stop_proxy_scan(&self) {
+        self.proxy.stop_probing()
+    }
+
+    /// Connect to a remote Socks5 proxy. If [no remote is given](Option::None), the system will
+    /// try to select a known proxy with the lowest latency.
+    pub fn connect_proxy(
+        &self,
+        remote: Option<SocketAddr>,
+    ) -> impl Future<Output = Result<SocketAddr, ConnectionError>> + Send {
+        let proxy = self.proxy.clone();
+        async move { proxy.connect(remote).await }
+    }
+
+    /// Disconnect from a remote Socks5 proxy, stopping all proxied connections as well.
+    pub fn disconnect_proxy(&self) {
+        self.proxy.disconnect()
+    }
+
+    /// Get a list of all proxies discovered by the system
+    pub fn known_proxies(&self) -> Vec<Ipv6Addr> {
+        self.proxy.known_proxies()
     }
 }
 
@@ -371,5 +488,61 @@ where
     ) -> MessageId {
         self.message_stack
             .reply_message(id, dst, data, try_duration)
+    }
+
+    /// Get a list of all configured topics
+    pub fn topics(&self) -> Vec<Vec<u8>> {
+        self.message_stack.topics()
+    }
+
+    pub fn topic_allowed_sources(&self, topic: &Vec<u8>) -> Option<Vec<Subnet>> {
+        self.message_stack.topic_allowed_sources(topic)
+    }
+
+    /// Sets the default topic action to accept or reject. This decides how topics which don't have
+    /// an explicit whitelist get handled.
+    pub fn accept_unconfigured_topic(&self, accept: bool) {
+        self.message_stack.set_default_topic_action(accept)
+    }
+
+    /// Whether a topic without default configuration is accepted or not.
+    pub fn unconfigure_topic_action(&self) -> bool {
+        self.message_stack.get_default_topic_action()
+    }
+
+    /// Add a topic to the whitelist without any configured allowed sources.
+    pub fn add_topic_whitelist(&self, topic: Vec<u8>) {
+        self.message_stack.add_topic_whitelist(topic)
+    }
+
+    /// Remove a topic from the whitelist. Future messages will follow the default action.
+    pub fn remove_topic_whitelist(&self, topic: Vec<u8>) {
+        self.message_stack.remove_topic_whitelist(topic)
+    }
+
+    /// Add a new whitelisted source for a topic. This creates the topic if it does not exist yet.
+    pub fn add_topic_whitelist_src(&self, topic: Vec<u8>, src: Subnet) {
+        self.message_stack.add_topic_whitelist_src(topic, src)
+    }
+
+    /// Remove a whitelisted source for a topic.
+    pub fn remove_topic_whitelist_src(&self, topic: Vec<u8>, src: Subnet) {
+        self.message_stack.remove_topic_whitelist_src(topic, src)
+    }
+
+    /// Set the forward socket for a topic. Creates the topic if it doesn't exist.
+    pub fn set_topic_forward_socket(&self, topic: Vec<u8>, socket_path: std::path::PathBuf) {
+        self.message_stack
+            .set_topic_forward_socket(topic, Some(socket_path))
+    }
+
+    /// Get the forward socket for a topic, if any.
+    pub fn get_topic_forward_socket(&self, topic: &Vec<u8>) -> Option<std::path::PathBuf> {
+        self.message_stack.get_topic_forward_socket(topic)
+    }
+
+    /// Removes the forward socket for the topic, if one exists
+    pub fn delete_topic_forward_socket(&self, topic: Vec<u8>) {
+        self.message_stack.set_topic_forward_socket(topic, None)
     }
 }

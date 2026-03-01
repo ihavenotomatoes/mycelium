@@ -6,19 +6,28 @@
 //! possible.
 
 use core::fmt;
+#[cfg(target_family = "unix")]
+use std::io;
+#[cfg(target_family = "unix")]
+use std::path::PathBuf;
 use std::{
     collections::{HashMap, VecDeque},
     marker::PhantomData,
     net::IpAddr,
     ops::{Deref, DerefMut},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     time::{self, Duration},
 };
 
 use futures::{Stream, StreamExt};
-use rand::Fill;
+use rand::RngExt;
 use serde::{de::Visitor, Deserialize, Deserializer, Serialize};
+#[cfg(target_family = "unix")]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(target_family = "unix")]
+use tokio::net::UnixStream;
 use tokio::sync::watch;
+use topic::MessageAction;
 use tracing::{debug, error, trace, warn};
 
 use crate::{
@@ -26,20 +35,28 @@ use crate::{
     data::DataPlane,
     message::{chunk::MessageChunk, done::MessageDone, init::MessageInit},
     metrics::Metrics,
+    subnet::Subnet,
 };
+
+pub use topic::TopicConfig;
 
 mod chunk;
 mod done;
 mod init;
+mod topic;
 
 /// The amount of time to try and send messages before we give up.
 const MESSAGE_SEND_WINDOW: Duration = Duration::from_secs(60 * 5);
 
 /// The amount of time to wait before sending a chunk again if receipt is not acknowledged.
-const RETRANSMISSION_DELAY: Duration = Duration::from_secs(1);
+const RETRANSMISSION_DELAY: Duration = Duration::from_millis(100);
 
 /// Amount of time between sweeps of the subscriber list to clear orphaned subscribers.
 const REPLY_SUBSCRIBER_CLEAR_DELAY: Duration = Duration::from_secs(60);
+
+/// Default timeout for waiting for a reply from a socket.
+#[cfg(target_family = "unix")]
+const SOCKET_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The average size of a single chunk. This is mainly intended to preallocate the chunk array on
 /// the receiver size. This value should allow reasonable overhead for standard MTU.
@@ -97,6 +114,8 @@ pub struct MessageStack<M> {
     /// This takes an Option as value to avoid the hassle of constructing a dummy value when
     /// creating the watch channel.
     reply_subscribers: Arc<Mutex<HashMap<MessageId, watch::Sender<Option<ReceivedMessage>>>>>,
+    /// Topic-specific configuration
+    topic_config: Arc<RwLock<TopicConfig>>,
 }
 
 struct MessageOutbox {
@@ -226,7 +245,11 @@ where
     /// Create a new `MessageStack`. This uses the provided [`DataPlane`] to inject message
     /// packets. Received packets must be injected into the `MessageStack` through the provided
     /// [`Stream`].
-    pub fn new<S>(data_plane: DataPlane<M>, message_packet_stream: S) -> Self
+    pub fn new<S>(
+        data_plane: DataPlane<M>,
+        message_packet_stream: S,
+        topic_config: Option<TopicConfig>,
+    ) -> Self
     where
         S: Stream<Item = (PacketBuffer, IpAddr, IpAddr)> + Send + Unpin + 'static,
     {
@@ -237,6 +260,7 @@ where
             outbox: Arc::new(Mutex::new(MessageOutbox::new())),
             subscriber,
             reply_subscribers: Arc::new(Mutex::new(HashMap::new())),
+            topic_config: Arc::new(RwLock::new(topic_config.unwrap_or_default())),
         };
 
         tokio::task::spawn(
@@ -371,6 +395,12 @@ where
         let flags = header.flags();
         let reply = if flags.init() {
             let is_reply = flags.reply();
+            let mi = MessageInit::new(mp);
+            // If this is not a reply, verify ACL
+            if !is_reply && !self.topic_allowed(mi.topic(), src) {
+                debug!("Dropping message whos src isn't allowed by ACL");
+                return;
+            }
             // We receive a new message with an ID. If we already have a complete message, ignore
             // it.
             let mut inbox = self.inbox.lock().unwrap();
@@ -380,7 +410,6 @@ where
             }
             // Otherwise unilaterally reset the state. The message id space is large enough to
             // avoid accidental collisions.
-            let mi = MessageInit::new(mp);
             let expected_chunks = (mi.length() as usize).div_ceil(AVERAGE_CHUNK_SIZE);
             let chunks = vec![None; expected_chunks];
             let message = ReceivedMessageInfo {
@@ -416,7 +445,11 @@ where
                     return;
                 }
                 // Check max chunk idx.
-                let max_chunk_idx = message.len.div_ceil(MINIMUM_CHUNK_SIZE);
+                let max_chunk_idx = if message.len == 0 {
+                    0
+                } else {
+                    message.len.div_ceil(MINIMUM_CHUNK_SIZE) - 1
+                };
                 if mc.chunk_idx() > max_chunk_idx {
                     debug!("Dropping CHUNK because index is too high");
                     return;
@@ -527,7 +560,7 @@ where
                 // Use remove here since we are done with the subscriber
                 // TODO: only check this if the is_reply flag is set?
                 if let Some(sub) = subscribers.remove(&message.id) {
-                    if let Err(e) = sub.send(Some(message)) {
+                    if let Err(e) = sub.send(Some(message.clone())) {
                         debug!("Subscriber quit before we could send the reply");
                         // Move message to be read if there were no subscribers.
                         inbox.complete_msges.push_back(e.0.unwrap());
@@ -537,10 +570,79 @@ where
                         debug!("Informed subscriber of message reply");
                     }
                 } else {
-                    // Move message to be read if there were no subscribers.
-                    inbox.complete_msges.push_back(message);
-                    // Notify subscribers we have a new message.
-                    inbox.notify.send_replace(());
+                    // Check if the topic has a configured socket path
+                    let socket_path = self
+                        .topic_config
+                        .read()
+                        .expect("Can get read lock on topic config")
+                        .get_topic_forward_socket(&message.topic)
+                        .cloned();
+
+                    if let Some(socket_path) = socket_path {
+                        debug!(
+                            "Forwarding message {} to socket {}",
+                            message.id.as_hex(),
+                            socket_path.display()
+                        );
+
+                        // Clone the message for use in the async task
+                        let message_clone = message.clone();
+                        let message_stack = self.clone();
+
+                        // Drop the inbox lock before spawning the task to avoid deadlocks
+                        std::mem::drop(inbox);
+                        std::mem::drop(subscribers);
+
+                        // Spawn a task to handle the socket communication
+                        #[cfg(target_family = "unix")]
+                        tokio::task::spawn(async move {
+                            // Forward the message to the socket
+                            match message_stack
+                                .forward_to_socket(
+                                    &message_clone,
+                                    &socket_path,
+                                    SOCKET_REPLY_TIMEOUT,
+                                )
+                                .await
+                            {
+                                Ok(reply_data) => {
+                                    debug!(message_id = message_clone.id.as_hex(), "Received reply from socket, sending back to original sender");
+
+                                    // Send the reply back to the original sender
+                                    message_stack.reply_message(
+                                        message_clone.id,
+                                        message_clone.src_ip,
+                                        reply_data,
+                                        MESSAGE_SEND_WINDOW,
+                                    );
+                                }
+                                Err(e) => {
+                                    // Log the error
+                                    error!(err = % e, "Failed to forward message to socket");
+
+                                    // Fall back to pushing to the queue
+                                    let mut inbox = message_stack.inbox.lock().unwrap();
+                                    inbox.complete_msges.push_back(message_clone);
+                                    inbox.notify.send_replace(());
+                                }
+                            }
+                        });
+
+                        #[cfg(not(target_family = "unix"))]
+                        {
+                            let mut inbox = message_stack.inbox.lock().unwrap();
+                            inbox.complete_msges.push_back(message_clone);
+                            inbox.notify.send_replace(());
+                        }
+
+                        // Re-acquire the inbox lock to continue processing
+                        inbox = self.inbox.lock().unwrap();
+                    } else {
+                        // No socket path configured, push to the queue as usual
+                        inbox.complete_msges.push_back(message);
+                        // Notify subscribers we have a new message.
+                        inbox.notify.send_replace(());
+                    }
                 }
                 inbox.pending_msges.remove(&message_id);
 
@@ -586,6 +688,107 @@ where
             }
         }
     }
+
+    /// Check if a topic is allowed for a given src
+    fn topic_allowed(&self, topic: &[u8], src: IpAddr) -> bool {
+        if let Some(whitelist_config) = self
+            .topic_config
+            .read()
+            .expect("Can get read lock on topic config")
+            .whitelist()
+            .get(topic)
+        {
+            debug!(?topic, %src, "Checking allow list for topic");
+            for subnet in whitelist_config.subnets() {
+                if subnet.contains_ip(src) {
+                    return true;
+                }
+            }
+            false
+        } else {
+            let action = self
+                .topic_config
+                .read()
+                .expect("Can get read lock on topic config")
+                .default();
+            debug!(?action, ?topic, "Default action for topic");
+            matches!(action, MessageAction::Accept)
+        }
+    }
+
+    /// Forward a message to a Unix domain socket and wait for a reply
+    #[cfg(target_family = "unix")]
+    async fn forward_to_socket(
+        &self,
+        message: &ReceivedMessage,
+        socket_path: &PathBuf,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, SocketError> {
+        // Connect to the socket
+        let mut stream = UnixStream::connect(socket_path).await.map_err(|e| {
+            error!(
+                "Failed to connect to socket {}: {}",
+                socket_path.display(),
+                e
+            );
+            SocketError::IoError(e)
+        })?;
+
+        // Send the message data, wrap in a timeout as we can't set read timeout on the socket
+        tokio::time::timeout(timeout, stream.write_all(&message.data))
+            .await
+            .map_err(|_| SocketError::Timeout)?
+            .map_err(|e| {
+                error!("Failed to write to socket: {}", e);
+                SocketError::IoError(e)
+            })?;
+
+        // Read the reply
+        let mut reply = Vec::new();
+        match stream.read_to_end(&mut reply).await {
+            Ok(0) => {
+                debug!("Socket connection closed without sending a reply");
+                Err(SocketError::ConnectionClosed)
+            }
+            Ok(_) => {
+                debug!(reply_len = reply.len(), "Received reply from socket");
+                Ok(reply)
+            }
+            Err(e)
+                if e.kind() == io::ErrorKind::TimedOut || e.kind() == io::ErrorKind::WouldBlock =>
+            {
+                debug!("Timeout waiting for socket reply");
+                Err(SocketError::Timeout)
+            }
+            Err(e) => {
+                error!(err = %e, "Error reading from socket");
+                Err(SocketError::IoError(e))
+            }
+        }
+    }
+}
+
+/// Error type for socket communication
+#[derive(Debug)]
+#[cfg(target_family = "unix")]
+enum SocketError {
+    /// I/O error occurred during socket communication
+    IoError(io::Error),
+    /// Timeout occurred while waiting for a reply
+    Timeout,
+    /// Socket connection was closed unexpectedly
+    ConnectionClosed,
+}
+
+#[cfg(target_family = "unix")]
+impl core::fmt::Display for SocketError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IoError(e) => write!(f, "I/O Error {e}"),
+            Self::Timeout => f.pad("timeout waiting for reply"),
+            Self::ConnectionClosed => f.pad("socket closed before we read a reply"),
+        }
+    }
 }
 
 impl<M> MessageStack<M>
@@ -613,9 +816,108 @@ where
         data: Vec<u8>,
         try_duration: Duration,
     ) -> MessageId {
+        debug!(reply_to = reply_to.as_hex(), %dst, data_size = data.len(), "Sending reply to message");
         self.push_message(Some(reply_to), dst, data, vec![], try_duration, false)
             .expect("Empty topic is never too large")
             .0
+    }
+
+    /// Get a list of all configured topics
+    pub fn topics(&self) -> Vec<Vec<u8>> {
+        self.topic_config
+            .read()
+            .expect("Can get read lock on topic config")
+            .whitelist()
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// Get all allowed sources for a topic. If the topic does not exist, None is returned. If the
+    /// topic exists without any sources, Some is returend with an empty list.
+    pub fn topic_allowed_sources(&self, topic: &Vec<u8>) -> Option<Vec<Subnet>> {
+        self.topic_config
+            .read()
+            .expect("Can get read lock on topic config")
+            .whitelist()
+            .get(topic)
+            .map(|tc| tc.subnets().clone())
+    }
+
+    /// Gets whether unconfigured topics are accepted or not.
+    pub fn get_default_topic_action(&self) -> bool {
+        matches!(
+            self.topic_config
+                .read()
+                .expect("Can get read lock on topic config")
+                .default(),
+            MessageAction::Accept
+        )
+    }
+
+    /// Set the default action to take for an unconfigured topic (accept or reject)
+    pub fn set_default_topic_action(&self, accept: bool) {
+        self.topic_config
+            .write()
+            .expect("Can lock topic config for writing")
+            .set_default(if accept {
+                MessageAction::Accept
+            } else {
+                MessageAction::Reject
+            });
+    }
+
+    /// Add a topic to the whitelist without any configured allowed sources.
+    pub fn add_topic_whitelist(&self, topic: Vec<u8>) {
+        self.topic_config
+            .write()
+            .expect("Can lock topic config for writing")
+            .add_topic_whitelist(topic);
+    }
+
+    /// Remove a topic from the whitelist. Future messages will follow the default action.
+    pub fn remove_topic_whitelist(&self, topic: Vec<u8>) {
+        self.topic_config
+            .write()
+            .expect("Can lock topic config for writing")
+            .remove_topic_whitelist(&topic);
+    }
+
+    /// Add a new whitelisted source for a topic. This creates the topic if it does not exist yet.
+    pub fn add_topic_whitelist_src(&self, topic: Vec<u8>, src: Subnet) {
+        self.topic_config
+            .write()
+            .expect("Can lock topic config for writing")
+            .add_topic_whitelist_src(topic, src);
+    }
+
+    /// Remove a whitelisted source for a topic.
+    pub fn remove_topic_whitelist_src(&self, topic: Vec<u8>, src: Subnet) {
+        self.topic_config
+            .write()
+            .expect("Can lock topic config for writing")
+            .remove_topic_whitelist_src(&topic, src);
+    }
+
+    /// Set the forward socket for a topic. Does nothing if the topic doesn't exist.
+    pub fn set_topic_forward_socket(
+        &self,
+        topic: Vec<u8>,
+        socket_path: Option<std::path::PathBuf>,
+    ) {
+        self.topic_config
+            .write()
+            .expect("Can lock topic config for writing")
+            .set_topic_forward_socket(topic, socket_path);
+    }
+
+    /// Get the forward socket for a topic, if any.
+    pub fn get_topic_forward_socket(&self, topic: &Vec<u8>) -> Option<std::path::PathBuf> {
+        self.topic_config
+            .read()
+            .expect("Can get read lock on topic config")
+            .get_topic_forward_socket(topic)
+            .cloned()
     }
 
     /// Subscribe to a new message with the given ID. In practice, this will be a reply.
@@ -1056,11 +1358,12 @@ impl<M> Clone for MessageStack<M> {
             outbox: self.outbox.clone(),
             subscriber: self.subscriber.clone(),
             reply_subscribers: self.reply_subscribers.clone(),
+            topic_config: self.topic_config.clone(),
         }
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageInfo {
     /// The receiver of this message.
@@ -1075,7 +1378,7 @@ pub struct MessageInfo {
     pub msg_len: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TransmissionProgress {
     /// Pending transmission, the remote has not yet acknowledged our init message.
@@ -1106,7 +1409,7 @@ impl MessageId {
     fn new() -> Self {
         let mut id = Self([0u8; 8]);
 
-        id.0.fill(&mut rand::rng());
+        rand::rng().fill(&mut id.0);
 
         id
     }
@@ -1114,6 +1417,13 @@ impl MessageId {
     /// Get a hex representation of the `MessageId`.
     pub fn as_hex(&self) -> String {
         faster_hex::hex_string(&self.0)
+    }
+
+    /// Decode a message id from hex.
+    pub fn from_hex(input: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut dst = [0; 8];
+        faster_hex::hex_decode(input, &mut dst)?;
+        Ok(Self(dst))
     }
 }
 
@@ -1183,7 +1493,7 @@ impl MessagePacket {
     }
 
     /// Get a read only reference to the header of the `MessagePacket`.
-    pub fn header(&self) -> MessagePacketHeader {
+    pub fn header(&self) -> MessagePacketHeader<'_> {
         MessagePacketHeader {
             header: self.packet.buffer()[..MESSAGE_HEADER_SIZE]
                 .try_into()
@@ -1192,7 +1502,7 @@ impl MessagePacket {
     }
 
     /// Get a mutable reference to the header of the `MessagePacket`.
-    pub fn header_mut(&mut self) -> MessagePacketHeaderMut {
+    pub fn header_mut(&mut self) -> MessagePacketHeaderMut<'_> {
         MessagePacketHeaderMut {
             header: <&mut [u8] as TryInto<&mut [u8; MESSAGE_HEADER_SIZE]>>::try_into(
                 &mut self.packet.buffer_mut()[..MESSAGE_HEADER_SIZE],

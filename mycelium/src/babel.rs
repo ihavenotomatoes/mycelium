@@ -27,7 +27,7 @@ mod update;
 /// Magic byte to identify babel protocol packet.
 const BABEL_MAGIC: u8 = 42;
 /// The version of the protocol we are currently using.
-const BABEL_VERSION: u8 = 2;
+const BABEL_VERSION: u8 = 3;
 
 /// Size of a babel header on the wire.
 const HEADER_WIRE_SIZE: usize = 4;
@@ -299,10 +299,13 @@ mod tests {
         let mut sender = Framed::new(tx, super::Codec::new());
         let mut receiver = Framed::new(rx, super::Codec::new());
 
-        let rr = super::RouteRequest::new(Some(
-            Subnet::new(Ipv6Addr::new(0x400, 1, 2, 3, 0, 0, 0, 0).into(), 64)
-                .expect("64 is a valid IPv6 prefix size; qed"),
-        ));
+        let rr = super::RouteRequest::new(
+            Some(
+                Subnet::new(Ipv6Addr::new(0x400, 1, 2, 3, 0, 0, 0, 0).into(), 64)
+                    .expect("64 is a valid IPv6 prefix size; qed"),
+            ),
+            13,
+        );
 
         sender
             .send(rr.clone().into())

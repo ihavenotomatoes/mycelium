@@ -1,10 +1,13 @@
 use std::convert::TryFrom;
 use std::io;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 
 use tracing::{error, info};
 
 use metrics::Metrics;
 use mycelium::endpoint::Endpoint;
+use mycelium::peer_manager::PeerDiscoveryMode;
 use mycelium::{crypto, metrics, Config, Node};
 use once_cell::sync::Lazy;
 use tokio::sync::{mpsc, Mutex};
@@ -12,6 +15,17 @@ use tokio::time::{sleep, timeout, Duration};
 
 const CHANNEL_MSG_OK: &str = "ok";
 const CHANNEL_TIMEOUT: u64 = 2;
+
+/// Default Socks5 port.
+// TODO: Port should be included in mycelium response
+const DEFAULT_SOCKS_PORT: u16 = 1080;
+
+/// The default listening address for the HTTP API.
+const DEFAULT_HTTP_API_SERVER_ADDRESS: SocketAddr =
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8989);
+/// The default listening address for the JSON-RPC API.
+const DEFAULT_JSONRPC_API_SERVER_ADDRESS: SocketAddr =
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8990);
 
 #[cfg(target_os = "android")]
 fn setup_logging() {
@@ -73,7 +87,7 @@ static RESPONSE_CHANNEL: Lazy<ResponseChannelType> = Lazy::new(|| {
 
 #[tokio::main]
 #[allow(unused_variables)] // because tun_fd is only used in android and ios
-pub async fn start_mycelium(peers: Vec<String>, tun_fd: i32, priv_key: Vec<u8>) {
+pub async fn start_mycelium(peers: Vec<String>, tun_fd: i32, priv_key: Vec<u8>, enable_dns: bool, enable_api_server: bool) {
     #[cfg(any(target_os = "android", target_os = "ios", target_os = "macos"))]
     setup_logging_once();
 
@@ -90,8 +104,9 @@ pub async fn start_mycelium(peers: Vec<String>, tun_fd: i32, priv_key: Vec<u8>) 
         peers: endpoints,
         no_tun: false,
         tcp_listen_port: DEFAULT_TCP_LISTEN_PORT,
-        quic_listen_port: None,
-        peer_discovery_port: None, // disable multicast discovery
+        quic_listen_port: Some(DEFAULT_QUIC_LISTEN_PORT),
+        peer_discovery_port: 9650,
+        peer_discovery_mode: PeerDiscoveryMode::Disabled, // disable multicast discovery
         #[cfg(any(
             target_os = "linux",
             all(target_os = "macos", not(feature = "mactunfd")),
@@ -109,16 +124,32 @@ pub async fn start_mycelium(peers: Vec<String>, tun_fd: i32, priv_key: Vec<u8>) 
         ))]
         tun_fd: Some(tun_fd),
         update_workers: 1,
+        cdn_cache: None,
+        enable_dns,
     };
-    let _node = match Node::new(config).await {
+    let node = match Node::new(config).await {
         Ok(node) => {
             info!("node successfully created");
-            node
+            Arc::new(Mutex::new(node))
         }
         Err(err) => {
             error!("failed to create mycelium node: {err}");
             return;
         }
+    };
+
+    // Only spawn API servers when enabled.
+    let (_http_api, _rpc_api) = if enable_api_server {
+        let http_api = mycelium_api::Http::spawn(node.clone(), DEFAULT_HTTP_API_SERVER_ADDRESS);
+        info!("HTTP API server started on {}", DEFAULT_HTTP_API_SERVER_ADDRESS);
+
+        let rpc_api = mycelium_api::rpc::JsonRpc::spawn(node.clone(), DEFAULT_JSONRPC_API_SERVER_ADDRESS).await;
+        info!("JSON-RPC API server started on {}", DEFAULT_JSONRPC_API_SERVER_ADDRESS);
+
+        (Some(http_api), Some(rpc_api))
+    } else {
+        info!("API servers disabled by configuration");
+        (None, None)
     };
 
     let mut rx = COMMAND_CHANNEL.1.lock().await;
@@ -137,11 +168,51 @@ pub async fn start_mycelium(peers: Vec<String>, tun_fd: i32, priv_key: Vec<u8>) 
                     }
                     CmdType::Status => {
                         let mut vec: Vec<String> = Vec::new();
-                        for info in _node.peer_info() {
-                            vec.push(info.endpoint.proto().to_string() + ","+ info.endpoint.address().to_string().as_str()+","+ &info.connection_state.to_string());
+                        for info in node.lock().await.peer_info() {
+                            // Create a JSON object with detailed peer statistics
+                            let peer_json = serde_json::json!({
+                                "protocol": info.endpoint.proto().to_string(),
+                                "address": info.endpoint.address().to_string(),
+                                "peerType": info.pt.to_string(),
+                                "connectionState": info.connection_state.to_string(),
+                                "rxBytes": info.rx_bytes,
+                                "txBytes": info.tx_bytes,
+                                "discoveredSeconds": info.discovered,
+                                "lastConnectedSeconds": info.last_connected
+                            });
+                            vec.push(peer_json.to_string());
                         }
                         send_response(vec).await;
                     }
+                    CmdType::ProxyProbeStart => {
+                        info!("Received proxy probe start command");
+                        node.lock().await.start_proxy_scan();
+                        send_response(vec![CHANNEL_MSG_OK.to_string()]).await;
+                    },
+                    CmdType::ProxyProbeStop => {
+                        info!("Received proxy probe stop command");
+                        node.lock().await.stop_proxy_scan();
+                        send_response(vec![CHANNEL_MSG_OK.to_string()]).await;
+                    },
+                    CmdType::ProxyList => {
+                        info!("Received proxy list command");
+                        let known_proxies = node.lock().await.known_proxies();
+                        send_response(known_proxies.into_iter().map(|ip| SocketAddr::from((IpAddr::from(ip), DEFAULT_SOCKS_PORT)).to_string()).collect()).await;
+                    },
+                    CmdType::ProxyConnect(remote) => {
+                        info!(?remote, "Received proxy connect command");
+                        let res = match node.lock().await.connect_proxy(remote).await {
+                            Ok(v) => v.to_string(),
+                            Err(e) => e.to_string(),
+                        };
+                        send_response(vec![res]).await;
+                    },
+                    CmdType::ProxyDisconnect => {
+                        info!("Received proxy disconnect command");
+                        node.lock().await.disconnect_proxy();
+                        send_response(vec![CHANNEL_MSG_OK.to_string()]).await;
+                    },
+
                 }
             }
         }
@@ -156,6 +227,11 @@ struct Cmd {
 enum CmdType {
     Stop,
     Status,
+    ProxyProbeStart,
+    ProxyProbeStop,
+    ProxyList,
+    ProxyConnect(Option<SocketAddr>),
+    ProxyDisconnect,
 }
 
 struct Response {
@@ -181,6 +257,94 @@ pub async fn stop_mycelium() -> String {
 #[tokio::main]
 pub async fn get_peer_status() -> Vec<String> {
     if let Err(e) = send_command(CmdType::Status).await {
+        return vec![e.to_string()];
+    }
+
+    match recv_response().await {
+        Ok(mut resp) => {
+            resp.insert(0, CHANNEL_MSG_OK.to_string());
+            resp
+        }
+        Err(e) => vec![e.to_string()],
+    }
+}
+
+#[tokio::main]
+pub async fn start_proxy_probe() -> Vec<String> {
+    if let Err(e) = send_command(CmdType::ProxyProbeStart).await {
+        return vec![e.to_string()];
+    }
+
+    match recv_response().await {
+        Ok(mut resp) => {
+            resp.insert(0, CHANNEL_MSG_OK.to_string());
+            resp
+        }
+        Err(e) => vec![e.to_string()],
+    }
+}
+
+#[tokio::main]
+pub async fn stop_proxy_probe() -> Vec<String> {
+    if let Err(e) = send_command(CmdType::ProxyProbeStop).await {
+        return vec![e.to_string()];
+    }
+
+    match recv_response().await {
+        Ok(mut resp) => {
+            resp.insert(0, CHANNEL_MSG_OK.to_string());
+            resp
+        }
+        Err(e) => vec![e.to_string()],
+    }
+}
+
+#[tokio::main]
+pub async fn list_proxies() -> Vec<String> {
+    if let Err(e) = send_command(CmdType::ProxyList).await {
+        return vec![e.to_string()];
+    }
+
+    match recv_response().await {
+        Ok(mut resp) => {
+            resp.insert(0, CHANNEL_MSG_OK.to_string());
+            resp
+        }
+        Err(e) => vec![e.to_string()],
+    }
+}
+
+/// Conenct to the given proxy. Remote must either be an empty string, or a valid socket address
+/// (e.g. "[400:abcd:efgh::1]:1080").
+#[tokio::main]
+pub async fn proxy_connect(remote: String) -> Vec<String> {
+    let remote = if remote.is_empty() {
+        None
+    } else {
+        match remote.parse::<SocketAddr>() {
+            Ok(s) => Some(s),
+            Err(e) => {
+                return vec![e.to_string()];
+            }
+        }
+    };
+
+    if let Err(e) = send_command(CmdType::ProxyConnect(remote)).await {
+        return vec![e.to_string()];
+    }
+
+    match recv_response().await {
+        Ok(mut resp) => {
+            resp.insert(0, CHANNEL_MSG_OK.to_string());
+            resp
+        }
+        Err(e) => vec![e.to_string()],
+    }
+}
+
+#[tokio::main]
+pub async fn proxy_disconnect() -> Vec<String> {
+    if let Err(e) = send_command(CmdType::ProxyDisconnect).await {
         return vec![e.to_string()];
     }
 
@@ -257,6 +421,7 @@ impl Metrics for NoMetrics {}
 
 /// The default port on the underlay to listen on for incoming TCP connections.
 const DEFAULT_TCP_LISTEN_PORT: u16 = 9651;
+const DEFAULT_QUIC_LISTEN_PORT: u16 = 9651;
 
 fn convert_slice_to_array32(slice: &[u8]) -> Result<[u8; 32], std::array::TryFromSliceError> {
     <[u8; 32]>::try_from(slice)

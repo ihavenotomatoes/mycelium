@@ -1,9 +1,8 @@
-use futures::{SinkExt, StreamExt};
 use std::{
     error::Error,
     io,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc, RwLock, Weak,
     },
 };
@@ -11,12 +10,11 @@ use tokio::{
     select,
     sync::{mpsc, Notify},
 };
-use tokio_util::codec::Framed;
 use tracing::{debug, error, info, trace};
 
 use crate::{
-    connection::{self, Connection},
-    packet::{self, Packet},
+    connection::{Connection, ConnectionReadHalf, ConnectionWriteHalf},
+    packet::Packet,
 };
 use crate::{
     packet::{ControlPacket, DataPacket},
@@ -65,12 +63,7 @@ impl Peer {
         router_control_tx: mpsc::UnboundedSender<(ControlPacket, Peer)>,
         connection: C,
         dead_peer_sink: mpsc::Sender<Peer>,
-        bytes_written: Arc<AtomicU64>,
-        bytes_read: Arc<AtomicU64>,
     ) -> Result<Self, io::Error> {
-        // Wrap connection so we can get access to the counters.
-        let connection = connection::Tracked::new(bytes_read, bytes_written, connection);
-
         // Data channel for peer
         let (to_peer_data, mut from_routing_data) = mpsc::unbounded_channel::<DataPacket>();
         // Control channel for peer
@@ -90,21 +83,18 @@ impl Peer {
             }),
         };
 
-        // Framed for peer
-        // Used to send and receive packets from a TCP stream
-        let framed = Framed::with_capacity(connection, packet::Codec::new(), 128 << 10);
-        let (mut sink, mut stream) = framed.split();
-
         {
             let peer = peer.clone();
 
+            let (mut stream, mut sink) = connection.split();
+
+            let mut needs_flush = false;
+
             tokio::spawn(async move {
-                let mut needs_flush = false;
                 loop {
                     select! {
-                        // Received over the TCP stream
-                        frame = stream.next() => {
-                            match frame {
+                        packet = stream.receive_packet() => {
+                            match packet {
                                 Some(Ok(packet)) => {
                                     match packet {
                                         Packet::DataPacket(packet) => {
@@ -137,14 +127,13 @@ impl Peer {
                             }
                         }
 
-                        rv  = from_routing_data.recv(), if !needs_flush  => {
+                        rv = from_routing_data.recv(), if !needs_flush => {
                             match rv {
                                 None => break,
                                 Some(packet) => {
-
                                     needs_flush = true;
 
-                                    if let Err(e) = sink.feed(Packet::DataPacket(packet)).await {
+                                    if let Err(e) = sink.feed_data_packet(packet).await {
                                         error!("Failed to feed data packet to connection: {e}");
                                         break
                                     }
@@ -154,13 +143,13 @@ impl Peer {
                                         // There can be 2 cases of errors here, empty channel and no more
                                         // senders. In both cases we don't really care at this point.
                                         if let Ok(packet) = from_routing_data.try_recv() {
-                                            if let Err(e) = sink.feed(Packet::DataPacket(packet)).await {
+                                            if let Err(e) = sink.feed_data_packet(packet).await {
                                                 error!("Failed to feed data packet to connection: {e}");
                                                 break
                                             }
                                             trace!("Instantly queued ready packet to transfer to peer");
                                         } else {
-                                            // No packets ready, flush currently buffered ones
+                                            // no packets ready, flush currently buffered ones
                                             break
                                         }
                                     }
@@ -172,10 +161,9 @@ impl Peer {
                             match rv {
                                 None => break,
                                 Some(packet) => {
-
                                     needs_flush = true;
 
-                                    if let Err(e) = sink.feed(Packet::ControlPacket(packet)).await {
+                                    if let Err(e) = sink.feed_control_packet(packet).await {
                                         error!("Failed to feed control packet to connection: {e}");
                                         break
                                     }
@@ -184,7 +172,7 @@ impl Peer {
                                         // There can be 2 cases of errors here, empty channel and no more
                                         // senders. In both cases we don't really care at this point.
                                         if let Ok(packet) = from_routing_control.try_recv() {
-                                            if let Err(e) = sink.feed(Packet::ControlPacket(packet)).await {
+                                            if let Err(e) = sink.feed_control_packet(packet).await {
                                                 error!("Failed to feed data packet to connection: {e}");
                                                 break
                                             }
@@ -198,8 +186,8 @@ impl Peer {
                         }
 
                         r = sink.flush(), if needs_flush => {
-                            if let Err(err) = r {
-                                error!("Failed to flush peer connection: {err}");
+                            if let Err(e) = r {
+                                error!("Failed to flush buffered peer connection  packets: {e}");
                                 break
                             }
                             needs_flush = false;
@@ -207,8 +195,8 @@ impl Peer {
 
                         _ = death_watcher.notified() => {
                             // Attempt gracefull shutdown
-                            let mut framed = sink.reunite(stream).expect("SplitSink and SplitStream here can only be part of the same original Framned; Qed");
-                            let _ = framed.close().await;
+                            // let mut framed = sink.reunite(stream).expect("SplitSink and SplitStream here can only be part of the same original Framned; Qed");
+                            // let _ = framed.close().await;
                             break;
                         }
                     }

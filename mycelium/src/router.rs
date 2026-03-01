@@ -5,14 +5,44 @@ use crate::{
     metric::Metric,
     metrics::Metrics,
     packet::{ControlPacket, DataPacket},
+    packet_queue::{PacketQueue, QueuedPacketData, UnencryptedPacket},
     peer::Peer,
     router_id::RouterId,
-    routing_table::{RouteEntry, RouteKey, RouteList, RoutingTable},
+    routing_table::{
+        NoRouteSubnet, QueriedSubnet, RouteEntry, RouteKey, RouteList, Routes, RoutingTable,
+    },
+    rr_cache::RouteRequestCache,
     seqno_cache::{SeqnoCache, SeqnoRequestCacheKey},
     sequence_number::SeqNo,
     source_table::{FeasibilityDistance, SourceKey, SourceTable},
     subnet::Subnet,
 };
+
+/// Result of looking up a shared secret for a destination.
+#[derive(Clone)]
+pub enum SharedSecretResult {
+    /// A route exists and the shared secret is available.
+    Found(SharedSecret),
+    /// A route query is in progress. The caller should queue the packet for later processing.
+    Resolving,
+    /// No route exists and no query is in progress. The destination is unreachable.
+    NoRoute,
+}
+
+/// Result of querying the route status for a specific destination.
+pub enum RouteStatus {
+    /// A selected route exists with the given metric.
+    Selected(Metric),
+    /// Route exists but is not selected (fallback only).
+    Fallback,
+    /// Route query is in progress.
+    Queried,
+    /// Destination marked as unreachable.
+    NoRoute,
+    /// No information about this destination.
+    Unknown,
+}
+use dashmap::DashMap;
 use etherparse::{
     icmpv6::{DestUnreachableCode, TimeExceededCode},
     Icmpv6Type,
@@ -20,8 +50,11 @@ use etherparse::{
 use std::{
     error::Error,
     hash::{Hash, Hasher},
-    net::IpAddr,
-    sync::{Arc, RwLock},
+    net::{IpAddr, Ipv6Addr},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, RwLock,
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender};
@@ -34,7 +67,7 @@ const IHU_INTERVAL: Duration = Duration::from_secs(HELLO_INTERVAL * 3);
 /// Max time used in UPDATE packets. For local (static) routes this is the timeout they are
 /// advertised with.
 const UPDATE_INTERVAL: Duration = Duration::from_secs(HELLO_INTERVAL * 3 * 5);
-/// Time between route table dumps to peers.
+/// Time between selected route announcements to peers.
 const ROUTE_PROPAGATION_INTERVAL: Duration = UPDATE_INTERVAL;
 /// Amount of seconds that can elapse before we consider a [`Peer`] as dead from the routers POV.
 /// Since IHU's are sent in response to HELLO packets, this MUST be greater than the
@@ -56,10 +89,59 @@ const BIG_METRIC_CHANGE_TRESHOLD: Metric = Metric::new(10);
 const SIGNIFICANT_METRIC_IMPROVEMENT: Metric = Metric::new(10);
 
 /// Hold retracted routes for 1 minute before purging them from the [`RoutingTable`].
-const RETRACTED_ROUTE_HOLD_TIME: Duration = Duration::from_secs(60);
+const RETRACTED_ROUTE_HOLD_TIME: Duration = Duration::from_secs(6);
 
 /// The interval specified in updates if the update won't be repeated.
-const INTERVAL_NOT_REPEATING: Duration = Duration::from_millis(0);
+const INTERVAL_NOT_REPEATING: Duration = Duration::from_millis(6);
+
+/// The maximum generation of a [`RouteRequest`] we are still willing to transmit.
+const MAX_RR_GENERATION: u8 = 16;
+
+/// Give a route query 15 seconds to resolve, this should be plenty generous.
+const ROUTE_QUERY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The threshold for route expiry under which we want to send a route requets for a subnet if it is used.
+const ROUTE_ALMOST_EXPIRED_TRESHOLD: tokio::time::Duration = Duration::from_secs(15);
+
+/// Statistics for packets routed for a single IP address.
+pub struct PacketStats {
+    packet_count: AtomicU64,
+    byte_count: AtomicU64,
+}
+
+impl PacketStats {
+    fn new() -> Self {
+        Self {
+            packet_count: AtomicU64::new(0),
+            byte_count: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, bytes: u64) {
+        self.packet_count.fetch_add(1, Ordering::Relaxed);
+        self.byte_count.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
+/// A single entry of packet statistics for an IP address.
+#[derive(Clone, Debug)]
+pub struct PacketStatEntry {
+    /// IP address.
+    pub ip: Ipv6Addr,
+    /// Number of packets routed.
+    pub packet_count: u64,
+    /// Total bytes routed.
+    pub byte_count: u64,
+}
+
+/// Packet statistics grouped by source and destination.
+#[derive(Clone, Debug)]
+pub struct PacketStatistics {
+    /// Statistics per source IP.
+    pub by_source: Vec<PacketStatEntry>,
+    /// Statistics per destination IP.
+    pub by_destination: Vec<PacketStatEntry>,
+}
 
 pub struct Router<M> {
     routing_table: RoutingTable,
@@ -80,8 +162,21 @@ pub struct Router<M> {
     /// Channel to notify the router of expired SourceKey's.
     expired_source_key_sink: mpsc::Sender<SourceKey>,
     seqno_cache: SeqnoCache,
+    rr_cache: RouteRequestCache,
     update_workers: usize,
+    /// Queue for packets waiting for route discovery.
+    packet_queue: PacketQueue,
+    /// Channel for sending unencrypted packets back to the data plane when routes become available.
+    pending_packet_tx: UnboundedSender<UnencryptedPacket>,
+    /// Channel for sending timed-out unencrypted packets to the data plane for ICMP generation.
+    timeout_packet_tx: UnboundedSender<UnencryptedPacket>,
+    /// Channel for notifying the data plane when routes become available (for incoming packet queue).
+    incoming_route_tx: UnboundedSender<Subnet>,
     metrics: M,
+    /// Packet statistics per source IP.
+    packet_stats_by_src: Arc<DashMap<Ipv6Addr, PacketStats>>,
+    /// Packet statistics per destination IP.
+    packet_stats_by_dst: Arc<DashMap<Ipv6Addr, PacketStats>>,
 }
 
 impl<M> Router<M>
@@ -93,6 +188,12 @@ where
     /// # Panics
     ///
     /// If update_workers is not in the range of [1..255], this will panic.
+    ///
+    /// Returns the Router and three receivers:
+    /// - `pending_packet_rx`: unencrypted packets that were queued and are now ready to be processed
+    /// - `timeout_packet_rx`: unencrypted packets that timed out waiting for route discovery (for ICMP generation)
+    /// - `incoming_route_rx`: notifications when routes become available (for incoming packet queue)
+    #[allow(clippy::type_complexity)]
     pub fn new(
         update_workers: usize,
         node_tun: UnboundedSender<DataPacket>,
@@ -101,7 +202,15 @@ where
         node_keypair: (SecretKey, PublicKey),
         update_filters: Vec<Box<dyn RouteUpdateFilter + Send + Sync>>,
         metrics: M,
-    ) -> Result<Self, Box<dyn Error>> {
+    ) -> Result<
+        (
+            Self,
+            UnboundedReceiver<UnencryptedPacket>,
+            UnboundedReceiver<UnencryptedPacket>,
+            UnboundedReceiver<Subnet>,
+        ),
+        Box<dyn Error>,
+    > {
         // We could use a NonZeroU8 here, but for now just handle this manually as this might get
         // changed in the future.
         if !(1..255).contains(&update_workers) {
@@ -115,12 +224,23 @@ where
         let (expired_source_key_sink, expired_source_key_stream) = mpsc::channel(1);
         let (expired_route_entry_sink, expired_route_entry_stream) = mpsc::channel(1);
         let (dead_peer_sink, dead_peer_stream) = mpsc::channel(100);
+        let (query_timeout_sink, query_timeout_stream) = mpsc::channel(100);
 
-        let routing_table = RoutingTable::new(expired_route_entry_sink);
+        let routing_table = RoutingTable::new(expired_route_entry_sink, query_timeout_sink);
 
         let router_id = RouterId::new(node_keypair.1);
 
         let seqno_cache = SeqnoCache::new();
+        let rr_cache = RouteRequestCache::new(ROUTE_ALMOST_EXPIRED_TRESHOLD);
+
+        let packet_queue = PacketQueue::new();
+
+        // Channel for sending unencrypted packets back to data plane when routes become available
+        let (pending_packet_tx, pending_packet_rx) = mpsc::unbounded_channel();
+        // Channel for sending timed-out unencrypted packets to data plane for ICMP generation
+        let (timeout_packet_tx, timeout_packet_rx) = mpsc::unbounded_channel();
+        // Channel for notifying data plane when routes become available (for incoming packet queue)
+        let (incoming_route_tx, incoming_route_rx) = mpsc::unbounded_channel();
 
         let router = Router {
             routing_table,
@@ -137,9 +257,16 @@ where
             dead_peer_sink,
             expired_source_key_sink,
             seqno_cache,
+            rr_cache,
             update_filters: Arc::new(update_filters),
             update_workers,
+            packet_queue,
+            pending_packet_tx,
+            timeout_packet_tx,
+            incoming_route_tx,
             metrics,
+            packet_stats_by_src: Arc::new(DashMap::new()),
+            packet_stats_by_dst: Arc::new(DashMap::new()),
         };
 
         tokio::spawn(Router::start_periodic_hello_sender(router.clone()));
@@ -151,8 +278,8 @@ where
             router.clone(),
             router_data_rx,
         ));
+
         tokio::spawn(Router::propagate_static_routes(router.clone()));
-        tokio::spawn(Router::propagate_selected_routes(router.clone()));
 
         tokio::spawn(Router::check_for_dead_peers(router.clone()));
 
@@ -168,7 +295,17 @@ where
 
         tokio::spawn(Router::process_dead_peers(router.clone(), dead_peer_stream));
 
-        Ok(router)
+        tokio::spawn(Router::process_query_timeouts(
+            router.clone(),
+            query_timeout_stream,
+        ));
+
+        Ok((
+            router,
+            pending_packet_rx,
+            timeout_packet_rx,
+            incoming_route_rx,
+        ))
     }
 
     pub fn router_control_tx(&self) -> UnboundedSender<(ControlPacket, Peer)> {
@@ -202,16 +339,18 @@ where
         peer.set_time_last_received_hello(tokio::time::Instant::now());
         peer.set_time_last_received_ihu(tokio::time::Instant::now());
 
-        // Request route table dump of peer
-        debug!(
-            "Requesting route table dump from {}",
-            peer.connection_identifier()
-        );
-        if let Err(e) = peer.send_control_packet(RouteRequest::new(None).into()) {
-            error!(
-                "Failed to request route table dump from {}: {e}",
-                peer.connection_identifier()
-            );
+        // Send route requests for all currently queried subnets to the new peer,
+        // so it can help resolve ongoing queries.
+        let read_guard = self.routing_table.read();
+        for queried in read_guard.iter_queries() {
+            let route_request = RouteRequest::new(Some(queried.subnet()), 0);
+            if peer.send_control_packet(route_request.into()).is_err() {
+                debug!(
+                    subnet = %queried.subnet(),
+                    peer = peer.connection_identifier(),
+                    "Can't send route request for queried subnet to new peer"
+                );
+            }
         }
     }
 
@@ -225,27 +364,159 @@ where
         self.router_id
     }
 
+    /// Get a reference to the metrics.
+    pub fn metrics(&self) -> &M {
+        &self.metrics
+    }
+
     /// Get the [`PublicKey`] for an [`IpAddr`] if a route exists to the IP.
     pub fn get_pubkey(&self, ip: IpAddr) -> Option<PublicKey> {
-        self.routing_table
-            .best_routes(ip)
-            .and_then(|rl| if rl.is_empty() { None } else { Some(rl) })
-            .map(|rl| rl[0].source().router_id().to_pubkey())
+        if let Routes::Exist(routes) = self.routing_table.best_routes(ip) {
+            if routes.is_empty() {
+                None
+            } else {
+                Some(routes[0].source().router_id().to_pubkey())
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Returns a snapshot of all packet statistics.
+    pub fn packet_statistics(&self) -> PacketStatistics {
+        let by_source = self
+            .packet_stats_by_src
+            .iter()
+            .map(|entry| {
+                let (ip, stats) = entry.pair();
+                PacketStatEntry {
+                    ip: *ip,
+                    packet_count: stats.packet_count.load(Ordering::Relaxed),
+                    byte_count: stats.byte_count.load(Ordering::Relaxed),
+                }
+            })
+            .collect();
+
+        let by_destination = self
+            .packet_stats_by_dst
+            .iter()
+            .map(|entry| {
+                let (ip, stats) = entry.pair();
+                PacketStatEntry {
+                    ip: *ip,
+                    packet_count: stats.packet_count.load(Ordering::Relaxed),
+                    byte_count: stats.byte_count.load(Ordering::Relaxed),
+                }
+            })
+            .collect();
+
+        PacketStatistics {
+            by_source,
+            by_destination,
+        }
     }
 
     /// Gets the cached [`SharedSecret`] for the remote.
-    pub fn get_shared_secret_from_dest(&self, dest: IpAddr) -> Option<SharedSecret> {
-        self.routing_table
-            .best_routes(dest)
-            // We can index here safely since we always have at least 1 route if we get
-            // Option::Some.
-            .map(|rl| rl.shared_secret().clone())
+    ///
+    /// Returns a [`SharedSecretResult`] indicating whether a route exists, is being resolved,
+    /// or is unreachable. If no route exists, a route request is sent.
+    pub fn get_shared_secret_from_dest(&self, dest: IpAddr) -> SharedSecretResult {
+        match self.routing_table.best_routes(dest) {
+            Routes::Exist(routes) => SharedSecretResult::Found(routes.shared_secret().clone()),
+            Routes::Queried => SharedSecretResult::Resolving, // Query in progress
+            Routes::NoRoute => SharedSecretResult::NoRoute,
+            Routes::None => {
+                // NOTE: we request the full /64 subnet
+                self.send_route_request(
+                    Subnet::new(dest, 64)
+                        .expect("64 is a valid subnet size for an IPv6 address; qed"),
+                );
+                SharedSecretResult::Resolving
+            }
+        }
+    }
+
+    /// Get a [`SharedSecret`] for a remote, if a selected route exists to the remote.
+    ///
+    /// Returns a [`SharedSecretResult`] indicating whether a selected route exists, is being
+    /// resolved, or is unreachable. If no route exists, a route request is sent.
+    pub fn get_shared_secret_if_selected(&self, dest: IpAddr) -> SharedSecretResult {
+        match self.routing_table.best_routes(dest) {
+            Routes::Exist(routes) => {
+                if routes.selected().is_some() {
+                    SharedSecretResult::Found(routes.shared_secret().clone())
+                } else {
+                    // Optimistically try to fetch a new route for the subnet for next time.
+                    if let Some(route_entry) = routes.iter().next() {
+                        // We have a fallback route, use the source key from that to do a seqno
+                        // request. Since the next hop might be dead, just do a broadcast. This
+                        // might be blocked by the seqno request cache.
+                        self.send_seqno_request(route_entry.source(), None, None);
+                    } else {
+                        // We don't have any routes, so send a route request. this might fail due
+                        // to the source table.
+                        self.send_route_request(
+                            Subnet::new(dest, 64)
+                                .expect("64 is a valid subnet size for an IPv6 address; qed"),
+                        );
+                    }
+                    SharedSecretResult::Resolving
+                }
+            }
+            Routes::Queried => SharedSecretResult::Resolving, // Query in progress
+            Routes::NoRoute => SharedSecretResult::NoRoute,
+            Routes::None => {
+                // NOTE: we request the full /64 subnet
+                self.send_route_request(
+                    Subnet::new(dest, 64)
+                        .expect("64 is a valid subnet size for an IPv6 address; qed"),
+                );
+                SharedSecretResult::Resolving
+            }
+        }
     }
 
     /// Gets the cached [`SharedSecret`] based on the associated [`PublicKey`] of the remote.
     #[inline]
-    pub fn get_shared_secret_by_pubkey(&self, dest: &PublicKey) -> Option<SharedSecret> {
+    pub fn get_shared_secret_by_pubkey(&self, dest: &PublicKey) -> SharedSecretResult {
         self.get_shared_secret_from_dest(dest.address().into())
+    }
+
+    /// Enqueue an unencrypted packet waiting for route discovery.
+    ///
+    /// This is used by the data plane when it cannot encrypt a packet because
+    /// the route (and thus the shared secret) is not yet available.
+    /// When a route becomes available, the packet will be sent back to the data plane
+    /// via the pending packet channel for encryption and routing.
+    /// If the route query times out, packets will be sent to the timeout channel for ICMP generation.
+    pub fn enqueue_unencrypted_packet(
+        &self,
+        subnet: Subnet,
+        packet: UnencryptedPacket,
+    ) -> Result<(), UnencryptedPacket> {
+        self.packet_queue
+            .enqueue_unencrypted(subnet, packet, &self.metrics)
+    }
+
+    /// Drop all queued packets for a subnet and send unencrypted ones to timeout channel for ICMP.
+    ///
+    /// This is called when a route query times out or when we lose a route.
+    fn drop_queued_packets(&self, subnet: Subnet) {
+        let packets = self.packet_queue.drop_subnet(subnet, &self.metrics);
+        debug!(
+            packets = packets.len(),
+            %subnet,
+            "Dropping pending packets for subnet"
+        );
+        for packet_data in packets {
+            if let QueuedPacketData::Unencrypted(p) = packet_data {
+                if let Err(e) = self.timeout_packet_tx.send(p) {
+                    debug!("Failed to send timed-out packet to data plane: {e}");
+                }
+            }
+            // Encrypted packets that time out are just dropped - no ICMP needed since
+            // they're already encrypted and we can't generate proper ICMP for them
+        }
     }
 
     /// Get a reference to this `Router`s' dead peer sink.
@@ -295,6 +566,41 @@ where
             .flat_map(|(_, rl)| rl.iter().cloned().collect::<Vec<_>>())
             .filter(|re| !re.selected())
             .collect()
+    }
+
+    /// Get a list of all [`queried subnets`](QueriedSubnet).
+    pub fn load_queried_subnets(&self) -> Vec<QueriedSubnet> {
+        self.routing_table.read().iter_queries().collect()
+    }
+
+    pub fn load_no_route_entries(&self) -> Vec<NoRouteSubnet> {
+        self.routing_table.read().iter_no_route().collect()
+    }
+
+    /// Get the route status for a destination IP (pure query, no side effects). If a selected
+    /// route exists, the returned metric includes the link cost of the peer.
+    pub fn route_status(&self, dest: IpAddr) -> RouteStatus {
+        match self.routing_table.best_routes(dest) {
+            Routes::Exist(routes) => {
+                if let Some(selected) = routes.selected() {
+                    RouteStatus::Selected(
+                        selected.metric() + Metric::from(selected.neighbour().link_cost()),
+                    )
+                } else {
+                    RouteStatus::Fallback
+                }
+            }
+            Routes::Queried => RouteStatus::Queried,
+            Routes::NoRoute => RouteStatus::NoRoute,
+            Routes::None => RouteStatus::Unknown,
+        }
+    }
+
+    /// Trigger a route request for the given destination.
+    pub fn request_route(&self, dest: IpAddr) {
+        self.send_route_request(
+            Subnet::new(dest, 64).expect("64 is a valid subnet size for an IPv6 address; qed"),
+        );
     }
 
     /// Task which periodically checks for dead peers in the Router.
@@ -377,6 +683,39 @@ where
         }
     }
 
+    /// Process queued packets for a subnet after a route becomes available.
+    ///
+    /// This dequeues all packets waiting for the given subnet and forwards them
+    /// using the newly installed route. Encrypted packets are routed directly,
+    /// while unencrypted packets are sent to the data plane for encryption.
+    fn process_queued_packets(&self, subnet: Subnet) {
+        let packets = self.packet_queue.dequeue(subnet, &self.metrics);
+
+        if packets.is_empty() {
+            return;
+        }
+
+        debug!(
+            subnet = %subnet,
+            packet_count = packets.len(),
+            "Forwarding queued packets after route installed"
+        );
+
+        for packet_data in packets {
+            match packet_data {
+                QueuedPacketData::Encrypted(packet) => {
+                    self.route_packet(packet);
+                }
+                QueuedPacketData::Unencrypted(packet) => {
+                    // Send to data plane for encryption and routing
+                    if let Err(e) = self.pending_packet_tx.send(packet) {
+                        debug!("Failed to send pending packet to data plane: {e}");
+                    }
+                }
+            }
+        }
+    }
+
     /// Run route selection for a given subnet.
     ///
     /// This will cause a triggered update if needed.
@@ -392,6 +731,16 @@ where
         // If there is no selected route there is nothing to do here. We keep expired routes in the
         // table for a while so updates of those should already have propagated to peers.
         let route_list = routes.routes();
+
+        // Track whether we had a valid (non-retracted) selected route before
+        let had_valid_selected = !route_list.is_empty()
+            && route_list[0].selected()
+            && !route_list[0].metric().is_infinite();
+
+        // Track whether we need to process queued packets after dropping the lock
+        let mut should_process_queue = false;
+        let mut should_drop_queue = false;
+
         // If we have a new selected route we must have at least 1 item in the route list so
         // accessing the 0th list element here is fine.
         if let Some(new_selected) = self.find_best_route(&route_list).cloned() {
@@ -411,6 +760,11 @@ where
             }
 
             routes.set_selected(new_selected.neighbour());
+
+            // If we didn't have a valid selected route before and now we do, process queued packets
+            if !had_valid_selected && !new_selected.metric().is_infinite() {
+                should_process_queue = true;
+            }
         } else if !route_list.is_empty() && route_list[0].selected() {
             // This means we went from a selected route to a non-selected route. Unselect route and
             // trigger update.
@@ -419,11 +773,23 @@ where
             // entry.
             self.send_seqno_request(route_list[0].source(), None, None);
             routes.unselect();
+
+            // We lost our selected route - drop any queued packets
+            should_drop_queue = true;
         }
 
         drop(routes);
 
         self.trigger_update(subnet, None);
+
+        // Process or drop queued packets after releasing the route lock
+        if should_process_queue {
+            self.process_queued_packets(subnet);
+            // Notify data plane for incoming packet queue
+            let _ = self.incoming_route_tx.send(subnet);
+        } else if should_drop_queue {
+            self.drop_queued_packets(subnet);
+        }
     }
 
     /// Remove expired source keys from the router state.
@@ -439,6 +805,15 @@ where
         warn!("Expired source key processing halted");
     }
 
+    /// Handle query timeouts by dropping queued packets for subnets that transitioned to NoRoute.
+    async fn process_query_timeouts(self, mut query_timeout_stream: mpsc::Receiver<Subnet>) {
+        while let Some(subnet) = query_timeout_stream.recv().await {
+            debug!(subnet = %subnet, "Route query timed out, sending ICMP for queued packets");
+            self.drop_queued_packets(subnet);
+        }
+        warn!("Query timeout processing halted");
+    }
+
     /// Remove expired route keys from the router state.
     async fn process_expired_route_keys(
         self,
@@ -452,7 +827,7 @@ where
             {
                 // Load current key
                 let Some(mut routes) = self.routing_table.routes_mut(rk.subnet()) else {
-                    // Subnet now known anymore. This means an expiration timer fired while the entry
+                    // Subnet not known anymore. This means an expiration timer fired while the entry
                     // itself is gone already.
                     warn!(%subnet, "Route key expired for unknown subnet");
                     continue;
@@ -518,6 +893,7 @@ where
                 break;
             }
             self.handle_dead_peer(&tx_buf[..received]);
+            tx_buf.clear();
         }
         warn!("Processing of dead peers halted");
     }
@@ -769,40 +1145,22 @@ where
     /// Process a route request. We reply with an Update if we have a selected route for the
     /// requested subnet. If no subnet is requested (in other words the wildcard address), we dump
     /// the full routing table.
-    fn handle_incoming_route_request(&self, route_request: babel::RouteRequest, source_peer: Peer) {
+    fn handle_incoming_route_request(
+        &self,
+        mut route_request: babel::RouteRequest,
+        source_peer: Peer,
+    ) {
         self.metrics
             .router_process_route_request(route_request.prefix().is_none());
         // Handle the case of a single subnet.
         if let Some(subnet) = route_request.prefix() {
-            let update = if let Some(sre) = self
-                .routing_table
-                .routes(subnet)
-                .as_ref()
-                .and_then(|rl| rl.selected())
-            {
-                trace!("Advertising selected route for {subnet} after route request");
-                // Optimization: Don't send an update if the selected route next-hop is the peer
-                // who requested the route, as per the babel protocol the update will never be
-                // accepted.
-                if sre.neighbour() == &source_peer {
-                    trace!("Not advertising route since the next-hop is the requesting peer");
-                    return;
-                }
-                babel::Update::new(
-                    advertised_update_interval(sre),
-                    sre.seqno(),
-                    sre.metric() + Metric::from(sre.neighbour().link_cost()),
-                    subnet,
-                    sre.source().router_id(),
-                )
-            }
-            // Could be a request for a static route/subnet.
-            else if let Some(static_route) = self
+            // Check if these are local routes by chance
+            let update = if let Some(static_route) = self
                 .static_routes
                 .iter()
                 .find(|sr| sr.contains_subnet(&subnet))
             {
-                trace!(
+                debug!(
                     "Advertising static route {static_route} in response to route request for {subnet}"
                 );
                 babel::Update::new(
@@ -812,24 +1170,120 @@ where
                     *static_route,
                     self.router_id,
                 )
-            }
-            // If the requested route is not present, send a retraction
-            else {
-                trace!(
-                    "Sending retraction for unknown subnet {subnet} in response to route request"
-                );
-                babel::Update::new(
-                    INTERVAL_NOT_REPEATING,
-                    self.router_seqno.read().unwrap().0, // Retractions receive the seqno of the router
-                    Metric::infinite(),                  // Static route has no further hop costs
-                    subnet,                              // Advertise the exact subnet requested
-                    self.router_id, // Our own router ID, since we advertise this
-                )
+            } else {
+                // If we have existing routes, attempt to send the selected route
+                match self.routing_table.routes(subnet) {
+                    Routes::Exist(routes) => {
+                        if let Some(sre) = routes.selected() {
+                            trace!("Advertising selected route for {subnet} after route request");
+                            // Optimization: Don't send an update if the selected route next-hop is the peer
+                            // who requested the route, as per the babel protocol the update will never be
+                            // accepted.
+                            if sre.neighbour() == &source_peer {
+                                trace!(
+                                "Not advertising route since the next-hop is the requesting peer"
+                            );
+                                return;
+                            }
+                            babel::Update::new(
+                                advertised_update_interval(sre),
+                                sre.seqno(),
+                                sre.metric() + Metric::from(sre.neighbour().link_cost()),
+                                subnet,
+                                sre.source().router_id(),
+                            )
+                        } else {
+                            // We don't have a selected route but we do have routes. It seems all routes
+                            // are currently unfeasible. Don't send an update, but also don't send a
+                            // retraction since we know the subnet exists
+                            return;
+                        }
+                    }
+                    // If the route is queried already we don't have to do anything.
+                    // TODO: metric
+                    Routes::Queried => return,
+                    Routes::NoRoute => {
+                        // We explicitly don't have a route for this subnet, so send a retraction to
+                        // notify our peer as soon as possible not to expect anything.
+                        babel::Update::new(
+                            INTERVAL_NOT_REPEATING,
+                            self.router_seqno.read().unwrap().0, // Retractions receive the seqno of the router
+                            Metric::infinite(), // Static route has no further hop costs
+                            subnet,             // Advertise the exact subnet requested
+                            self.router_id,     // Our own router ID, since we advertise this
+                        )
+                    }
+                    Routes::None => {
+                        // We don't have a route, but we also don't have confirmation locally that the
+                        // route does not exist. Forward the route request to the remainder of our
+                        // peers and search for the route.
+                        //
+                        // First check the generation of the route request, if it is too high we simply
+                        // ignore it. Check against the eventually bumped generation.
+                        if route_request.generation() + 1 >= MAX_RR_GENERATION {
+                            // Drop route request
+                            // TODO: metric
+                            return;
+                        }
+                        route_request.inc_generation();
+
+                        debug!(
+                            rr.subnet = %subnet,
+                            rr.generation = route_request.generation(),
+                            "Forwarding route request to peers"
+                        );
+
+                        self.routing_table.mark_queried(
+                            subnet,
+                            tokio::time::Instant::now() + ROUTE_QUERY_TIMEOUT,
+                        );
+
+                        let received_peers =
+                            if let Some((gen, received_peers)) = self.rr_cache.info(subnet) {
+                                // If this route request has a smaller generation than the one we
+                                // recently sent, send regardless
+                                if route_request.generation() < gen {
+                                    vec![]
+                                } else {
+                                    received_peers
+                                }
+                            } else {
+                                vec![]
+                            };
+
+                        let peers = self.peer_interfaces();
+
+                        // Now transmit to all our peers, except the sender
+                        for peer in peers.iter().filter(|p| *p != &source_peer) {
+                            if received_peers.contains(peer) {
+                                trace!(%subnet, peer = peer.connection_identifier(), "Not forwarding route request to peer who recently got a request from us");
+                                continue;
+                            }
+
+                            if peer
+                                .send_control_packet(route_request.clone().into())
+                                .is_err()
+                            {
+                                debug!(
+                                    rr.subnet = %subnet,
+                                    rr.generation = route_request.generation(),
+                                    peer = peer.connection_identifier(),
+                                    "Can't forward route request to dead peer"
+                                );
+                            }
+                        }
+
+                        self.rr_cache.sent_route_request(route_request, peers);
+
+                        return;
+                    }
+                }
             };
 
             self.update_source_table(&update);
             self.send_update(&source_peer, update);
         } else {
+            // TODO: Is this still needed?
             // Requested a full route table dump
             trace!("Dumping route table after wildcard route request");
             self.propagate_selected_routes_to_peer(&source_peer);
@@ -859,12 +1313,7 @@ where
         // requested router id, or the router id is the same and the entries sequence number is
         // not smaller than the requested sequence number, send an update for the route
         // to the peer (triggered update).
-        if let Some(route_entry) = self
-            .routing_table
-            .routes(seqno_request.prefix())
-            .as_ref()
-            .and_then(|rl| rl.selected())
-        {
+        if let Some(route_entry) = self.routing_table.routes(seqno_request.prefix()).selected() {
             if !route_entry.metric().is_infinite()
                 && (seqno_request.router_id() != route_entry.source().router_id()
                     || !route_entry.seqno().lt(&seqno_request.seqno()))
@@ -968,7 +1417,9 @@ where
                 }
             }
 
-            if let Some(possible_routes) = self.routing_table.routes(seqno_request.prefix()) {
+            if let Routes::Exist(possible_routes) =
+                self.routing_table.routes(seqno_request.prefix())
+            {
                 {
                     let source_table = self.source_table.read().unwrap();
                     // First only consider feasible routes.
@@ -1276,7 +1727,11 @@ where
         // What doesn't constitue a large change:
         // - small metric change
         // - seqno increase (unless it is requested by a peer)
-        let trigger_update = match (&old_selected_route, new_selected_route) {
+        // Track if we need to process or drop queued packets
+        let mut should_process_queue = false;
+        let mut should_drop_queue = false;
+
+        let trigger_update = match (&old_selected_route, &new_selected_route) {
             (Some(old_route), Some(new_route)) => {
                 if new_route.neighbour() != old_route.neighbour() {
                     debug!(
@@ -1285,6 +1740,10 @@ where
                         new_next_hop = new_route.neighbour().connection_identifier(),
                         "Selected route changed next-hop",
                     );
+                }
+                // If old route was retracted but new route is not, process queue
+                if old_route.metric().is_infinite() && !new_route.metric().is_infinite() {
+                    should_process_queue = true;
                 }
                 // Router id changed.
                 new_route.source().router_id() != old_route.source().router_id()
@@ -1296,6 +1755,10 @@ where
                     peer = new_route.neighbour().connection_identifier(),
                     "Acquired route",
                 );
+                // Acquired a new route - process any queued packets
+                if !new_route.metric().is_infinite() {
+                    should_process_queue = true;
+                }
                 true
             }
             (Some(old_route), None) => {
@@ -1304,6 +1767,8 @@ where
                     peer = old_route.neighbour().connection_identifier(),
                     "Lost route",
                 );
+                // Lost our route - drop any queued packets
+                should_drop_queue = true;
                 true
             }
             (None, None) => false,
@@ -1320,6 +1785,15 @@ where
             // If we have some interest in an update because we forwarded a seqno request but we
             // aren't triggering an update, notify just the interested peers.
             self.trigger_update(subnet, interested_peers);
+        }
+
+        // Process or drop queued packets based on route state changes
+        if should_process_queue {
+            self.process_queued_packets(subnet);
+            // Notify data plane for incoming packet queue
+            let _ = self.incoming_route_tx.send(subnet);
+        } else if should_drop_queue {
+            self.drop_queued_packets(subnet);
         }
     }
 
@@ -1390,7 +1864,7 @@ where
                     .iter()
                     .cloned()
                     .collect()
-            } else if let Some(known_routes) = known_routes {
+            } else if let Routes::Exist(known_routes) = known_routes {
                 known_routes
                     .iter()
                     .filter_map(|re| {
@@ -1406,7 +1880,18 @@ where
             }
         };
 
+        // Don't overload peers with request for the same source key
+        let already_received = self.seqno_cache.get(&srck).unwrap_or_default();
+
         for peer in targets {
+            if already_received.contains(&peer) {
+                trace!(
+                    peer = peer.connection_identifier(),
+                    "Don't send seqno request to peer which already received it recently"
+                );
+                continue;
+            }
+
             debug!(
                 "Sending seqno_request to {} for seqno {} of {}",
                 peer.connection_identifier(),
@@ -1441,6 +1926,17 @@ where
             data_packet.dst_ip,
         );
 
+        // Record packet statistics
+        let packet_size = data_packet.raw_data.len() as u64;
+        self.packet_stats_by_src
+            .entry(data_packet.src_ip)
+            .or_insert_with(PacketStats::new)
+            .record(packet_size);
+        self.packet_stats_by_dst
+            .entry(data_packet.dst_ip)
+            .or_insert_with(PacketStats::new)
+            .record(packet_size);
+
         if data_packet.hop_limit < 2 {
             self.metrics.router_route_packet_ttl_expired();
             self.time_exceeded(data_packet);
@@ -1454,23 +1950,111 @@ where
                 error!("Error sending data packet to TUN interface: {:?}", e);
             }
         } else {
-            match self.routing_table.selected_route(data_packet.dst_ip.into()) {
-                Some(route_entry) => {
-                    self.metrics.router_route_packet_forward();
-                    if let Err(e) = route_entry.neighbour().send_data_packet(data_packet) {
-                        error!(
-                            "Error sending data packet to peer {}: {:?}",
-                            route_entry.neighbour().connection_identifier(),
-                            e
-                        );
+            match self.routing_table.best_routes(data_packet.dst_ip.into()) {
+                Routes::Exist(routes) => match routes.selected() {
+                    Some(route_entry) => {
+                        // Prematurely send a route request if the route is almost expired
+                        if route_entry
+                            .expires()
+                            .duration_since(tokio::time::Instant::now())
+                            < ROUTE_ALMOST_EXPIRED_TRESHOLD
+                        {
+                            self.send_route_request(
+                                Subnet::new(data_packet.dst_ip.into(), 64)
+                                    .expect("64 is a valid subnet size for IPv6, qed;"),
+                            );
+                        }
+
+                        self.metrics.router_route_packet_forward();
+
+                        if let Err(e) = route_entry.neighbour().send_data_packet(data_packet) {
+                            error!(
+                                "Error sending data packet to peer {}: {:?}",
+                                route_entry.neighbour().connection_identifier(),
+                                e
+                            );
+                        }
+                    }
+                    None => {
+                        self.metrics.router_route_packet_no_route();
+                        self.no_route_to_host(data_packet);
+                    }
+                },
+                Routes::Queried => {
+                    // Enqueue packet instead of blocking - it will be forwarded when route is found
+                    let subnet = Subnet::new(data_packet.dst_ip.into(), 64)
+                        .expect("64 is a valid subnet size for IPv6 addresses");
+                    if let Err(returned_packet) =
+                        self.packet_queue
+                            .enqueue_encrypted(subnet, data_packet, &self.metrics)
+                    {
+                        // Queue full - send ICMP immediately
+                        self.metrics.router_route_packet_no_route();
+                        self.no_route_to_host(returned_packet);
                     }
                 }
-                None => {
+                Routes::NoRoute => {
                     self.metrics.router_route_packet_no_route();
                     self.no_route_to_host(data_packet);
                 }
+                Routes::None => {
+                    // Send route request
+                    // NOTE: we request the full /64 subnet
+                    let subnet = Subnet::new(data_packet.dst_ip.into(), 64)
+                        .expect("64 is a valid subnet size for IPv6 addresses");
+                    self.send_route_request(subnet);
+
+                    // Enqueue packet instead of blocking - it will be forwarded when route is found
+                    if let Err(returned_packet) =
+                        self.packet_queue
+                            .enqueue_encrypted(subnet, data_packet, &self.metrics)
+                    {
+                        // Queue full - send ICMP immediately
+                        self.metrics.router_route_packet_no_route();
+                        self.no_route_to_host(returned_packet);
+                    }
+                }
             }
         }
+    }
+
+    /// Send a [`RouteRequest`] for the [`Subnet`] to all peers.
+    fn send_route_request(&self, subnet: Subnet) {
+        let route_request = RouteRequest::new(Some(subnet), 0);
+
+        self.routing_table
+            .mark_queried(subnet, tokio::time::Instant::now() + ROUTE_QUERY_TIMEOUT);
+
+        // Don't care about generation here
+        let received_peers = if let Some((gen, receivers)) = self.rr_cache.info(subnet) {
+            // If the previous request was a higher generation, send the reques with lower
+            // generation to all our peers again
+            if gen > 0 {
+                vec![]
+            } else {
+                receivers
+            }
+        } else {
+            vec![]
+        };
+
+        let peers = self.peer_interfaces();
+
+        for peer in peers.iter() {
+            if received_peers.contains(peer) {
+                trace!(%subnet, peer = peer.connection_identifier(), "Not forwarding route request to peer who recently got a request from us");
+                continue;
+            }
+
+            if peer
+                .send_control_packet(route_request.clone().into())
+                .is_err()
+            {
+                debug!(subnet = %subnet, "Could not send route request to peer");
+            }
+        }
+
+        self.rr_cache.sent_route_request(route_request, peers);
     }
 
     /// Handle a received data packet.
@@ -1540,8 +2124,8 @@ where
 
         // Get shared secret from node and dest address
         let shared_secret = match self.get_shared_secret_from_dest(data_packet.src_ip.into()) {
-            Some(ss) => ss,
-            None => {
+            SharedSecretResult::Found(ss) => ss,
+            _ => {
                 debug!(
                     "No entry found for destination address {}, dropping packet",
                     data_packet.src_ip
@@ -1560,83 +2144,10 @@ where
         });
     }
 
-    /// Task to propagate the static routes periodically
-    async fn propagate_static_routes(self) {
-        loop {
-            tokio::time::sleep(ROUTE_PROPAGATION_INTERVAL).await;
-
-            trace!("Propagating static routes");
-
-            for peer in self.peer_interfaces.read().unwrap().iter() {
-                self.propagate_static_route_to_peer(peer)
-            }
-        }
-    }
-
     /// Propagate all static routes to all known peers.
     fn propagate_static_routes_to_peers(&self) {
         for peer in self.peer_interfaces.read().unwrap().iter() {
             self.propagate_static_route_to_peer(peer);
-        }
-    }
-
-    /// Task to propagate selected routes periodically
-    async fn propagate_selected_routes(self) {
-        loop {
-            tokio::time::sleep(ROUTE_PROPAGATION_INTERVAL).await;
-
-            trace!("Propagating selected routes");
-
-            let start = Instant::now();
-
-            for (subnet, sre) in
-                self.routing_table
-                    .read()
-                    .iter()
-                    .filter_map(|(subnet, route_list)| {
-                        route_list.selected().map(|sr| (subnet, sr.clone()))
-                    })
-            {
-                let neigh_link_cost = Metric::from(sre.neighbour().link_cost());
-
-                // the cost of the route is the cost of the route + the cost of the link to the next-hop
-                let metric = sre.metric() + neigh_link_cost;
-                let seqno = sre.seqno();
-                let router_id = sre.source().router_id();
-
-                let update = babel::Update::new(
-                    advertised_update_interval(&sre),
-                    seqno,
-                    metric,
-                    subnet,
-                    router_id,
-                );
-
-                // Before sending an update, the source table might need to be updated
-                self.update_source_table(&update);
-
-                // send the update to the peer
-                for peer in self.peer_interfaces.read().unwrap().iter() {
-                    debug!(
-                        subnet = %subnet,
-                        metric = %metric,
-                        seqno = %seqno,
-                        peer = peer.connection_identifier(),
-                        "Propagating route update",
-                    );
-                    // Don't send updates for a route to the next hop of the route, as that peer will never
-                    // select the route through us (that would caus a routing loop). The protocol can
-                    // handle this just fine, leaving this out is essentially an easy optimization.
-                    if peer == sre.neighbour() {
-                        continue;
-                    }
-
-                    self.send_update(peer, update.clone());
-                }
-            }
-
-            self.metrics
-                .router_time_spent_periodic_propagating_selected_routes(start.elapsed());
         }
     }
 
@@ -1726,6 +2237,19 @@ where
                 "Failed to send update to dead peer {}",
                 peer.connection_identifier()
             );
+        }
+    }
+
+    /// Task to propagate the static routes periodically
+    async fn propagate_static_routes(self) {
+        loop {
+            tokio::time::sleep(ROUTE_PROPAGATION_INTERVAL).await;
+
+            trace!("Propagating static routes");
+
+            for peer in self.peer_interfaces.read().unwrap().iter() {
+                self.propagate_static_route_to_peer(peer)
+            }
         }
     }
 
@@ -1865,8 +2389,15 @@ where
             dead_peer_sink: self.dead_peer_sink.clone(),
             expired_source_key_sink: self.expired_source_key_sink.clone(),
             seqno_cache: self.seqno_cache.clone(),
+            rr_cache: self.rr_cache.clone(),
             update_workers: self.update_workers,
+            packet_queue: self.packet_queue.clone(),
+            pending_packet_tx: self.pending_packet_tx.clone(),
+            timeout_packet_tx: self.timeout_packet_tx.clone(),
+            incoming_route_tx: self.incoming_route_tx.clone(),
             metrics: self.metrics.clone(),
+            packet_stats_by_src: self.packet_stats_by_src.clone(),
+            packet_stats_by_dst: self.packet_stats_by_dst.clone(),
         }
     }
 }
@@ -1904,15 +2435,14 @@ fn advertised_update_interval(sre: &RouteEntry) -> Duration {
 mod tests {
     use std::{
         net::{IpAddr, Ipv6Addr},
-        sync::{atomic::AtomicU64, Arc},
         time::Duration,
     };
 
     use tokio::sync::mpsc;
 
     use crate::{
-        babel::Update, crypto::PublicKey, metric::Metric, peer::Peer, router_id::RouterId,
-        sequence_number::SeqNo, source_table::SourceKey, subnet::Subnet,
+        babel::Update, connection::DuplexStream, crypto::PublicKey, metric::Metric, peer::Peer,
+        router_id::RouterId, sequence_number::SeqNo, source_table::SourceKey, subnet::Subnet,
     };
 
     #[test]
@@ -1969,10 +2499,8 @@ mod tests {
         let neighbor = Peer::new(
             router_data_tx,
             router_control_tx,
-            con1,
+            DuplexStream::new(con1),
             dead_peer_sink,
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
         )
         .expect("Can create a dummy peer");
         let subnet = Subnet::new(IpAddr::V6(Ipv6Addr::new(0x400, 0, 0, 0, 0, 0, 0, 0)), 64)

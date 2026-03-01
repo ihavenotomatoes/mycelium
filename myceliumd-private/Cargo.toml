@@ -1,6 +1,6 @@
 [package]
 name = "myceliumd-private"
-version = "0.5.7"
+version = "0.7.3"
 edition = "2021"
 license-file = "../LICENSE"
 readme = "./README.md"
@@ -14,25 +14,11 @@ name = "mycelium-private"
 path = "src/main.rs"
 
 [dependencies]
-clap = { version = "4.5.32", features = ["derive"] }
-tracing = { version = "0.1.41", features = ["release_max_level_debug"] }
-tracing-logfmt = { version = "0.3.5", features = ["ansi_logs"] }
-tracing-subscriber = { version = "0.3.19", features = [
-  "env-filter",
-  "nu-ansi-term",
-] }
-mycelium = { path = "../mycelium", features = ["private-network", "message"] }
-mycelium-metrics = { path = "../mycelium-metrics", features = ["prometheus"] }
-mycelium-api = { path = "../mycelium-api", features = ["message"] }
-mycelium-cli = { path = "../mycelium-cli/", features = ["message"] }
-serde = { version = "1.0.219", features = ["derive"] }
-serde_json = "1.0.140"
-tokio = { version = "1.44.0", features = [
+clap = { version = "4.5.59", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+tokio = { version = "1.49.0", features = [
   "macros",
   "rt-multi-thread",
-  "signal",
 ] }
-reqwest = { version = "0.12.9", default-features = false, features = ["json"] }
-base64 = "0.22.1"
-config = "0.15.9"
-dirs = "6.0.0"
+mycelium = { path = "../mycelium", features = ["private-network", "message"] }
+myceliumd-common = { path = "../myceliumd-common" }
