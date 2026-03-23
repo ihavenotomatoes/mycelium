@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- When a new peer connects, immediately announce our own subnet.
+
+### Changed
+
+- Reduced time before an unacknowledged message chunk gets retransmitted.
+- When a message chunk gets ACK'ed, immediately send a new chunk.
+
+### Fixed
+
+- On unix based systems, the created key file is no longer readable system-wide.
+- The message subsystem no longer removes peeked message if a topic filter is set.
+- Properly send back a read acknowledgement after popping/peeking a message while
+  a topic filter is set.
+- When we stop probing for socks proxies, replace the cancellation token so future
+  probes behave as expected.
+- Properly return an error from the API when trying to connect a proxy if we can't
+  bind the local socket.
+
+### Deprecated
+
+- Mycelium-ui (the stand alone GUI) will be removed in the next version. It was
+  never formally launched as a binary, and its inteded use has been replaced by
+  myceliumflut, which embeds a full mycelium node.
+
+### Removed
+
+- No longer maintain a list of "no-route" entries if a subnet query times out.
+
 ## [0.7.3] - 2026-02-09
 
 ### Fixed

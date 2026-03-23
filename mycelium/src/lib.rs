@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use crate::cdn::Cdn;
 use crate::packet_queue::IncomingPacketQueue;
-use crate::proxy::{ConnectionError, Proxy};
+use crate::proxy::{Proxy, ProxyError};
 use crate::tun::TunConfig;
 use bytes::BytesMut;
 use data::DataPlane;
@@ -19,7 +19,7 @@ use message::{
 };
 use metrics::Metrics;
 use peer_manager::{PeerDiscoveryMode, PeerExists, PeerNotFound, PeerStats, PrivateNetworkKey};
-use routing_table::{NoRouteSubnet, QueriedSubnet, RouteEntry};
+use routing_table::{QueriedSubnet, RouteEntry};
 use subnet::Subnet;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
@@ -367,11 +367,6 @@ where
         self.router.load_queried_subnets()
     }
 
-    /// List all [`subnets with no route`](NoRouteSubnet) in the system.
-    pub fn no_route_entries(&self) -> Vec<NoRouteSubnet> {
-        self.router.load_no_route_entries()
-    }
-
     /// Get public key from the IP of `Node`
     pub fn get_pubkey_from_ip(&self, ip: IpAddr) -> Option<crypto::PublicKey> {
         self.router.get_pubkey(ip)
@@ -402,7 +397,7 @@ where
     pub fn connect_proxy(
         &self,
         remote: Option<SocketAddr>,
-    ) -> impl Future<Output = Result<SocketAddr, ConnectionError>> + Send {
+    ) -> impl Future<Output = Result<SocketAddr, ProxyError>> + Send {
         let proxy = self.proxy.clone();
         async move { proxy.connect(remote).await }
     }

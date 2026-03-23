@@ -244,12 +244,6 @@ pub enum RoutesCommand {
         #[arg(long = "json", default_value_t = false)]
         json: bool,
     },
-    /// Print all subnets which are explicitly marked as not having a route
-    NoRoute {
-        /// Print subnets in JSON format
-        #[arg(long = "json", default_value_t = false)]
-        json: bool,
-    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -796,9 +790,6 @@ pub async fn dispatch_subcommand(
             RoutesCommand::Queried { json } => {
                 return mycelium_cli::list_queried_subnets(api_addr, json).await;
             }
-            RoutesCommand::NoRoute { json } => {
-                return mycelium_cli::list_no_route_entries(api_addr, json).await;
-            }
         },
         Command::Proxy { command } => match command {
             ProxyCommand::List { json } => {
@@ -878,7 +869,7 @@ pub async fn save_key_file(key: &crypto::SecretKey, path: &Path) -> io::Result<(
             .create(true)
             .truncate(true)
             .write(true)
-            .mode(0o644)
+            .mode(0o640)
             .open(path)
             .await?;
         file.write_all(key.as_bytes()).await?;

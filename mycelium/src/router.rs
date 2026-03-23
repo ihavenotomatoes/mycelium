@@ -8,9 +8,7 @@ use crate::{
     packet_queue::{PacketQueue, QueuedPacketData, UnencryptedPacket},
     peer::Peer,
     router_id::RouterId,
-    routing_table::{
-        NoRouteSubnet, QueriedSubnet, RouteEntry, RouteKey, RouteList, Routes, RoutingTable,
-    },
+    routing_table::{QueriedSubnet, RouteEntry, RouteKey, RouteList, Routes, RoutingTable},
     rr_cache::RouteRequestCache,
     seqno_cache::{SeqnoCache, SeqnoRequestCacheKey},
     sequence_number::SeqNo,
@@ -25,8 +23,6 @@ pub enum SharedSecretResult {
     Found(SharedSecret),
     /// A route query is in progress. The caller should queue the packet for later processing.
     Resolving,
-    /// No route exists and no query is in progress. The destination is unreachable.
-    NoRoute,
 }
 
 /// Result of querying the route status for a specific destination.
@@ -37,8 +33,6 @@ pub enum RouteStatus {
     Fallback,
     /// Route query is in progress.
     Queried,
-    /// Destination marked as unreachable.
-    NoRoute,
     /// No information about this destination.
     Unknown,
 }
@@ -339,6 +333,12 @@ where
         peer.set_time_last_received_hello(tokio::time::Instant::now());
         peer.set_time_last_received_ihu(tokio::time::Instant::now());
 
+        // Announce our own static route so the peer does not have to wait for the periodic
+        // announcement to learn it. This doesn't really matter that much since if the peer is
+        // looking for our route it should send a route request immediately as well for this
+        // subnet, but it doesn't hurt either way.
+        self.propagate_static_route_to_peer(&peer);
+
         // Send route requests for all currently queried subnets to the new peer,
         // so it can help resolve ongoing queries.
         let read_guard = self.routing_table.read();
@@ -424,7 +424,6 @@ where
         match self.routing_table.best_routes(dest) {
             Routes::Exist(routes) => SharedSecretResult::Found(routes.shared_secret().clone()),
             Routes::Queried => SharedSecretResult::Resolving, // Query in progress
-            Routes::NoRoute => SharedSecretResult::NoRoute,
             Routes::None => {
                 // NOTE: we request the full /64 subnet
                 self.send_route_request(
@@ -464,7 +463,6 @@ where
                 }
             }
             Routes::Queried => SharedSecretResult::Resolving, // Query in progress
-            Routes::NoRoute => SharedSecretResult::NoRoute,
             Routes::None => {
                 // NOTE: we request the full /64 subnet
                 self.send_route_request(
@@ -573,10 +571,6 @@ where
         self.routing_table.read().iter_queries().collect()
     }
 
-    pub fn load_no_route_entries(&self) -> Vec<NoRouteSubnet> {
-        self.routing_table.read().iter_no_route().collect()
-    }
-
     /// Get the route status for a destination IP (pure query, no side effects). If a selected
     /// route exists, the returned metric includes the link cost of the peer.
     pub fn route_status(&self, dest: IpAddr) -> RouteStatus {
@@ -591,7 +585,6 @@ where
                 }
             }
             Routes::Queried => RouteStatus::Queried,
-            Routes::NoRoute => RouteStatus::NoRoute,
             Routes::None => RouteStatus::Unknown,
         }
     }
@@ -805,7 +798,7 @@ where
         warn!("Expired source key processing halted");
     }
 
-    /// Handle query timeouts by dropping queued packets for subnets that transitioned to NoRoute.
+    /// Handle query timeouts by dropping queued packets for subnets whose query expired.
     async fn process_query_timeouts(self, mut query_timeout_stream: mpsc::Receiver<Subnet>) {
         while let Some(subnet) = query_timeout_stream.recv().await {
             debug!(subnet = %subnet, "Route query timed out, sending ICMP for queued packets");
@@ -1202,17 +1195,6 @@ where
                     // If the route is queried already we don't have to do anything.
                     // TODO: metric
                     Routes::Queried => return,
-                    Routes::NoRoute => {
-                        // We explicitly don't have a route for this subnet, so send a retraction to
-                        // notify our peer as soon as possible not to expect anything.
-                        babel::Update::new(
-                            INTERVAL_NOT_REPEATING,
-                            self.router_seqno.read().unwrap().0, // Retractions receive the seqno of the router
-                            Metric::infinite(), // Static route has no further hop costs
-                            subnet,             // Advertise the exact subnet requested
-                            self.router_id,     // Our own router ID, since we advertise this
-                        )
-                    }
                     Routes::None => {
                         // We don't have a route, but we also don't have confirmation locally that the
                         // route does not exist. Forward the route request to the remainder of our
@@ -1992,10 +1974,6 @@ where
                         self.metrics.router_route_packet_no_route();
                         self.no_route_to_host(returned_packet);
                     }
-                }
-                Routes::NoRoute => {
-                    self.metrics.router_route_packet_no_route();
-                    self.no_route_to_host(data_packet);
                 }
                 Routes::None => {
                     // Send route request
