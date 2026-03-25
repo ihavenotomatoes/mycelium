@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The version command in the CLI now once again correctly identifies if the binary
+  is the regular mycelium or the mycelium-private binary. 
+- Fixed router seqno rate limiting, which essentially prevented seqno bumping from
+  working. This should improve route acquisition after spurious network interrupts.
+
+## [0.7.4] - 2026-03-23
+
 ### Added
 
 - When a new peer connects, immediately announce our own subnet.
@@ -727,4 +736,5 @@ This is a breaking change, check the main README file for update info.
 [0.7.1]: https://github.com/threefoldtech/mycelium/compare/v0.7.0...v0.7.1
 [0.7.2]: https://github.com/threefoldtech/mycelium/compare/v0.7.1...v0.7.2
 [0.7.3]: https://github.com/threefoldtech/mycelium/compare/v0.7.2...v0.7.3
-[unreleased]: https://github.com/threefoldtech/mycelium/compare/v0.7.3...HEAD
+[0.7.4]: https://github.com/threefoldtech/mycelium/compare/v0.7.3...v0.7.4
+[unreleased]: https://github.com/threefoldtech/mycelium/compare/v0.7.4...HEAD
